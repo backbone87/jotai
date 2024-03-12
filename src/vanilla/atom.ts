@@ -1,3 +1,5 @@
+type AnyContext = Record<string, unknown>
+
 type Getter = <Value>(atom: Atom<Value>) => Value
 
 type Setter = <Value, Args extends unknown[], Result>(
@@ -12,9 +14,16 @@ type SetAtom<Args extends unknown[], Result> = <A extends Args>(
 /**
  * setSelf is for internal use only and subject to change without notice.
  */
-type Read<Value, SetSelf = never> = (
+type Read<Value, SetSelf = never, Context extends AnyContext = AnyContext> = (
   get: Getter,
-  options: { readonly signal: AbortSignal; readonly setSelf: SetSelf },
+  options: {
+    readonly set: Setter
+    readonly getUntracked: Getter
+    readonly recompute: () => void
+    readonly signal: AbortSignal
+    readonly setSelf: SetSelf
+    readonly context: Context
+  },
 ) => Value
 
 type Write<Args extends unknown[], Result> = (
@@ -37,10 +46,11 @@ type OnMount<Args extends unknown[], Result> = <
   setAtom: S,
 ) => OnUnmount | void
 
-export interface Atom<Value> {
+export interface Atom<Value, Context extends AnyContext = AnyContext> {
   toString: () => string
-  read: Read<Value>
-  unstable_is?(a: Atom<unknown>): boolean
+  is: typeof Object.is
+  derived: boolean
+  read: Read<Value, never, Context>
   debugLabel?: string
   /**
    * To ONLY be used by Jotai libraries to mark atoms as private. Subject to change.
@@ -49,9 +59,13 @@ export interface Atom<Value> {
   debugPrivate?: boolean
 }
 
-export interface WritableAtom<Value, Args extends unknown[], Result>
-  extends Atom<Value> {
-  read: Read<Value, SetAtom<Args, Result>>
+export interface WritableAtom<
+  Value,
+  Args extends unknown[],
+  Result,
+  Context extends AnyContext = AnyContext,
+> extends Atom<Value, Context> {
+  read: Read<Value, SetAtom<Args, Result>, Context>
   write: Write<Args, Result>
   onMount?: OnMount<Args, Result>
 }
@@ -67,13 +81,20 @@ export type PrimitiveAtom<Value> = WritableAtom<
 let keyCount = 0 // global key count for all atoms
 
 // writable derived atom
-export function atom<Value, Args extends unknown[], Result>(
-  read: Read<Value, SetAtom<Args, Result>>,
+export function atom<
+  Value,
+  Args extends unknown[],
+  Result,
+  Context extends AnyContext,
+>(
+  read: Read<Value, SetAtom<NoInfer<Args>, NoInfer<Result>>, Context>,
   write: Write<Args, Result>,
 ): WritableAtom<Value, Args, Result>
 
 // read-only derived atom
-export function atom<Value>(read: Read<Value>): Atom<Value>
+export function atom<Value, Context extends AnyContext = AnyContext>(
+  read: Read<Value, never, Context>,
+): Atom<Value>
 
 // write-only derived atom
 export function atom<Value, Args extends unknown[], Result>(
@@ -86,28 +107,40 @@ export function atom<Value>(
   initialValue: Value,
 ): PrimitiveAtom<Value> & WithInitialValue<Value>
 
-export function atom<Value, Args extends unknown[], Result>(
-  read: Value | Read<Value, SetAtom<Args, Result>>,
-  write?: Write<Args, Result>,
-) {
+export function atom<
+  Value,
+  Args extends unknown[],
+  Result,
+  Context extends AnyContext,
+>(
+  initialValueOrRead: Value | Read<Value, SetAtom<Args, Result>, Context>,
+  maybeWrite?: Write<Args, Result>,
+): Atom<Value> | PrimitiveAtom<Value> | WritableAtom<Value, Args, Result> {
+  type R = Read<Value, SetAtom<Args, Result>>
+
   const key = `atom${++keyCount}`
-  const config = {
-    toString: () => key,
-  } as WritableAtom<Value, Args, Result> & { init?: Value }
-  if (typeof read === 'function') {
-    config.read = read as Read<Value, SetAtom<Args, Result>>
-  } else {
-    config.init = read
-    config.read = defaultRead
-    config.write = defaultWrite as unknown as Write<Args, Result>
+
+  const toString = () => key
+  const is = Object.is
+  const derived = typeof initialValueOrRead === 'function'
+  const read: R = derived ? (initialValueOrRead as R) : defaultRead
+  let write:
+    | Write<Args, Result>
+    | Write<[SetStateAction<Value>], void>
+    | undefined = maybeWrite
+
+  if (!derived) {
+    write ??= defaultWrite
   }
-  if (write) {
-    config.write = write
-  }
-  return config
+
+  const init: Value | undefined = derived ? undefined : initialValueOrRead
+
+  const atom = { toString, is, derived, read, write, init }
+
+  return atom
 }
 
-function defaultRead<Value>(this: Atom<Value>, get: Getter) {
+function defaultRead<Value>(this: Atom<Value>, get: Getter): Value {
   return get(this)
 }
 
@@ -116,7 +149,7 @@ function defaultWrite<Value>(
   get: Getter,
   set: Setter,
   arg: SetStateAction<Value>,
-) {
+): void {
   return set(
     this,
     typeof arg === 'function'
@@ -124,3 +157,5 @@ function defaultWrite<Value>(
       : arg,
   )
 }
+
+type NoInfer<T> = [T][T extends any ? 0 : never]
