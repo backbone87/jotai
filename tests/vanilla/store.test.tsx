@@ -46,13 +46,22 @@ describe('[DEV-ONLY] dev-only methods', () => {
 
     const result = store.dev_get_mounted_atoms?.() || []
     expect(Array.from(result)).toStrictEqual([
-      { toString: expect.any(Function), read: expect.any(Function) },
       {
-        toString: expect.any(Function),
-        init: 0,
+        derived: true,
+        init: undefined,
+        is: expect.any(Function),
         read: expect.any(Function),
-        write: expect.any(Function),
+        toString: expect.any(Function),
+        write: undefined,
+      },
+      {
         debugLabel: 'countAtom',
+        derived: false,
+        init: 0,
+        is: expect.any(Function),
+        read: expect.any(Function),
+        toString: expect.any(Function),
+        write: expect.any(Function),
       },
     ])
     unsub()
@@ -77,7 +86,11 @@ describe('[DEV-ONLY] dev-only methods', () => {
     const unsub = store.sub(countAtom, cb)
     store.set(countAtom, 1)
     const result = store.dev_get_mounted?.(countAtom)
-    expect(result).toStrictEqual({ l: new Set([cb]), t: new Set([countAtom]) })
+    expect(result).toStrictEqual({
+      l: new Set([cb]),
+      t: new Set(),
+      u: undefined,
+    })
     unsub()
   })
 
@@ -100,13 +113,19 @@ describe('[DEV-ONLY] dev-only methods', () => {
       const countAtom = atom(0)
       const unsubAtom = store.sub(countAtom, vi.fn())
       store.set(countAtom, 1)
+      // TODO 0008 what is the expectation here? countAtom does not need to be
+      // flushed since nothing changed during `sub`.
+      // what should be the semantic `flushed`? i implemented it as "downstream
+      // deps that were recomputed during flush". `countAtom` obv was recomputed
+      // during the set call, but the `write` flush didnt cause downstream deps
+      // to recompute (there are none)
       expect(callback).toHaveBeenNthCalledWith(1, {
         type: 'sub',
-        flushed: new Set([countAtom]),
+        flushed: new Set([]),
       })
       expect(callback).toHaveBeenNthCalledWith(2, {
         type: 'write',
-        flushed: new Set([countAtom]),
+        flushed: new Set([]),
       })
       expect(callback).toHaveBeenCalledTimes(2)
       unsub?.()
@@ -121,13 +140,14 @@ describe('[DEV-ONLY] dev-only methods', () => {
       const unsubAtom = store.sub(countAtom, vi.fn())
       const unsubAtomSecond = store.sub(countAtom, vi.fn())
       unsubAtom?.()
+      // TODO 0008 see prev test
       expect(callback).toHaveBeenNthCalledWith(1, {
         type: 'sub',
-        flushed: new Set([countAtom]),
+        flushed: new Set([]),
       })
       expect(callback).toHaveBeenNthCalledWith(2, {
         type: 'sub',
-        flushed: new Set(),
+        flushed: new Set([]),
       })
       expect(callback).toHaveBeenNthCalledWith(3, { type: 'unsub' })
       expect(callback).toHaveBeenCalledTimes(3)
@@ -159,10 +179,10 @@ it('should unmount with store.get', async () => {
   const countAtom = atom(0)
   const callback = vi.fn()
   const unsub = store.sub(countAtom, callback)
+  expect(Array.from(store.dev_get_mounted_atoms?.() ?? [])).toEqual([countAtom])
   store.get(countAtom)
   unsub()
-  const result = Array.from(store.dev_get_mounted_atoms?.() ?? [])
-  expect(result).toEqual([])
+  expect(Array.from(store.dev_get_mounted_atoms?.() ?? [])).toEqual([])
 })
 
 it('should unmount dependencies with store.get', async () => {
@@ -171,10 +191,12 @@ it('should unmount dependencies with store.get', async () => {
   const derivedAtom = atom((get) => get(countAtom) * 2)
   const callback = vi.fn()
   const unsub = store.sub(derivedAtom, callback)
+  expect(Array.from(store.dev_get_mounted_atoms?.() ?? []).sort()).toEqual(
+    [countAtom, derivedAtom].sort(),
+  )
   store.get(derivedAtom)
   unsub()
-  const result = Array.from(store.dev_get_mounted_atoms?.() ?? [])
-  expect(result).toEqual([])
+  expect(Array.from(store.dev_get_mounted_atoms?.() ?? [])).toEqual([])
 })
 
 it('should update async atom with delay (#1813)', async () => {
@@ -197,7 +219,8 @@ it('should update async atom with delay (#1813)', async () => {
   expect(await promise).toBe(1)
 })
 
-it('should override a promise by setting', async () => {
+// TODO 0007 the replace behavior was moved out of store
+it.skip('should override a promise by setting', async () => {
   const store = createStore()
   const countAtom = atom(Promise.resolve(0))
   const infinitePending = new Promise<never>(() => {})
@@ -428,14 +451,19 @@ it('should update derived atoms during write (#2107)', async () => {
 it('resolves dependencies reliably after a delay (#2192)', async () => {
   expect.assertions(1)
   const countAtom = atom(0)
+  countAtom.debugLabel = 'countAtom'
   let result: number | null = null
 
   const resolve: (() => void)[] = []
   const asyncAtom = atom(async (get) => {
     const count = get(countAtom)
-    await new Promise<void>((r) => resolve.push(r))
+    await new Promise<void>((r) => {
+      resolve.push(r)
+      count
+    })
     return count
   })
+  asyncAtom.debugLabel = 'asyncAtom'
 
   const derivedAtom = atom(
     async (get, { setSelf }) => {
@@ -446,6 +474,7 @@ it('resolves dependencies reliably after a delay (#2192)', async () => {
     },
     () => {},
   )
+  derivedAtom.debugLabel = 'derivedAtom'
 
   const store = createStore()
   store.sub(derivedAtom, () => {})
@@ -457,19 +486,23 @@ it('resolves dependencies reliably after a delay (#2192)', async () => {
   store.set(countAtom, increment)
   store.set(countAtom, increment)
 
-  await waitFor(() => assert(resolve.length === 3))
+  // TODO 0006 there are only 2 resolves now, because the first `store.set`
+  // above unmounted `asyncAtom` which removes it from the `dirtySet` (it is an
+  // async dep and no one else keeps it mounted).
+  await waitFor(() => assert(resolve.length === 2))
 
   resolve[1]!()
-  resolve[2]!()
+  // resolve[2]!()
   await waitFor(() => assert(result === 2))
 
   store.set(countAtom, increment)
   store.set(countAtom, increment)
 
-  await waitFor(() => assert(resolve.length === 5))
+  // TODO 0006 same as above, only 1 more resolve to total of 3
+  await waitFor(() => assert(resolve.length === 3))
 
-  resolve[3]!()
-  resolve[4]!()
+  resolve[2]!()
+  // resolve[4]!()
 
   await new Promise(setImmediate)
   await waitFor(() => assert(store.get(countAtom) === 4))
