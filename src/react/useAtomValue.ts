@@ -7,11 +7,9 @@ import ReactExports, {
   useRef,
 } from 'react'
 import {
-  ReplaceableResource,
-  Resource,
+  TrackedResource,
   use as jotaiUse,
   original,
-  replace,
 } from '../vanilla/internal.ts'
 import type { Atom, ExtractAtomValue, Store } from '../vanilla.ts'
 import { useStore } from './Provider.ts'
@@ -21,12 +19,12 @@ const use = ReactExports.use ?? jotaiUse
 type Action<Value> = {
   store: Store
   atom: Atom<Value>
-  value: Resource<Awaited<Value>>
+  value: TrackedResource<Awaited<Value>>
 }
 type State<Value> = {
   store: Store
   atom: Atom<Value>
-  value: ReplaceableResource<Awaited<Value>>
+  value: TrackedResource<Awaited<Value>>
 }
 type Reducer<Value> = (
   prev: State<Value>,
@@ -68,27 +66,14 @@ export function useAtomValue<Value>(
       delay: undefined,
       timeout: undefined,
       reducer: (prev, { store, atom, value }) => {
-        // TODO 0007 we moved the "continue promise" logic here
-        // - benefit: store keeps identity of promises that are not async
-        //   derivations
-        // - benefit: atoms that are not "useAtomValue"d do not run the proxying
-        //   code which may be cheaper
-        // - drawback: the store might run more derivations and subscribers
-        //   despite the observable state of an atom not changing (pending ->
-        //   pending) but only the identity of the promise.
-        // this can be moved back to the store fairly easily
-        // we could also introduce a utility á la `unwrap` to make "store-only"
-        // atoms be replaceable
-        const nextValue = replace(prev.value, value)
-
-        return prev.value === nextValue &&
+        return prev.value === value &&
           prev.atom === atom &&
           prev.store === store
           ? prev
-          : { store, atom, value: nextValue }
+          : { store, atom, value }
       },
       initializer: () => {
-        return { store, atom, value: replace(undefined, store.resource(atom)) }
+        return { store, atom, value: store.resource(atom) }
       },
     }
 
@@ -106,7 +91,7 @@ export function useAtomValue<Value>(
 
   let { value } = state
   if (state.store !== store || state.atom !== atom) {
-    value = replace(value, store.resource(atom))
+    value = store.resource(atom)
     update({ store, atom, value })
   }
 

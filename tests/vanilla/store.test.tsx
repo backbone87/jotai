@@ -210,8 +210,7 @@ it('should update async atom with delay (#1813)', async () => {
   expect(await promise).toBe(1)
 })
 
-// TODO 0007 the replace behavior was moved out of store
-it.skip('should override a promise by setting', async () => {
+it('should override a promise by setting', async () => {
   const store = createStore()
   const countAtom = atom(Promise.resolve(0))
   const infinitePending = new Promise<never>(() => {})

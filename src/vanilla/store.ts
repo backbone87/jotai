@@ -2,21 +2,16 @@ import { type Atom, type WritableAtom } from './atom.ts'
 import {
   type FulfilledResource,
   type RejectedResource,
-  type UntrackedResource,
+  type TrackedResource,
   fulfilled,
   isResource,
   rejected,
-  track,
+  replace,
 } from './internal.ts'
 
 export type Store = {
   get: <Value>(atom: Atom<Value>) => Value
-  resource: <Value>(
-    atom: Atom<Value>,
-  ) =>
-    | UntrackedResource<Awaited<Value>>
-    | FulfilledResource<Awaited<Value>>
-    | RejectedResource<Awaited<Value>>
+  resource: <Value>(atom: Atom<Value>) => TrackedResource<Awaited<Value>>
   set: <Value, Args extends unknown[], Result>(
     atom: WritableAtom<Value, Args, Result>,
     ...args: Args
@@ -68,9 +63,24 @@ type Mount = {
  * tracked for both mounted and unmounted atoms in a store.
  */
 type AtomState<Value = AnyValue> =
-  | { r: UntrackedResource<Awaited<Value>>; v: Value; a: Abortable | void }
-  | { r: FulfilledResource<Awaited<Value>>; v: Value; a: Abortable | void }
-  | { r: RejectedResource<Awaited<Value>>; v: AnyError; a: Abortable | void }
+  | {
+      t: 'async'
+      r: TrackedResource<Awaited<Value>>
+      v: Value
+      a: Abortable | void
+    }
+  | {
+      t: 'sync'
+      r: FulfilledResource<Awaited<Value>>
+      v: Value
+      a: Abortable | void
+    }
+  | {
+      t: 'sync'
+      r: RejectedResource<Awaited<Value>>
+      v: AnyError
+      a: Abortable | void
+    }
 
 // for debugging purpose only
 type StoreListenerRev2 = (
@@ -87,11 +97,15 @@ const ASYNC_WRITE: Promise<FlushType> = Promise.resolve('async-write')
 const EMPTY_DEPS: Deps = new Map()
 
 const returnAtomValue = <Value>(state: AtomState<Value>): Value => {
+  if (state.t === 'async') {
+    return state.r as Value
+  }
+
   if (state.r.status === 'rejected') {
     throw state.r.reason
   }
 
-  return state.v as Value
+  return state.r.value
 }
 
 const invoke = (fn: () => void) => fn()
@@ -151,14 +165,26 @@ export const createStore = (): Store => {
     abort?: Reject extends false ? Abortable | undefined : never,
   ): AtomState<Value> => {
     if (reject) {
-      return { r: rejected(value), v: value, a: undefined }
+      return { t: 'sync', r: rejected(value), v: value, a: undefined }
     }
 
     if (isResource(value)) {
-      return { r: track(value), v: value, a: abort } as AtomState<Value>
+      const replaced = replace(undefined, value)
+
+      return {
+        t: 'async',
+        r: replaced,
+        v: value,
+        a: abort,
+      } as AtomState<Value>
     }
 
-    return { r: fulfilled(value), v: value, a: abort } as AtomState<Value>
+    return {
+      t: 'sync',
+      r: fulfilled(value),
+      v: value,
+      a: abort,
+    } as AtomState<Value>
   }
 
   const setAtomState = <Value, Rejected extends boolean>(
@@ -196,8 +222,10 @@ export const createStore = (): Store => {
 
     if (
       existingState !== undefined &&
-      (existingState.r.status === 'rejected') === reject &&
-      Object.is(existingState.v, value)
+      (existingState.t === 'async'
+        ? Object.is(existingState.v, value) || Object.is(existingState.r, value)
+        : (existingState.r.status === 'rejected') === reject &&
+          Object.is(existingState.v, value))
     ) {
       existingState.a?.abort()
       existingState.a = abort
@@ -218,7 +246,17 @@ export const createStore = (): Store => {
       }
     }
 
-    existingState?.a?.abort()
+    // TODO 0010 if we do store internal replace it would be better if we skip
+    // updates if the resource could have been replaced. a resource was replaced
+    // when `replace(existingResource, resource) === existingResource`
+    // right now we keep legacy behavior and just replace the existing
+    // resource while emitting a new state
+    if (existingState !== undefined) {
+      if (existingState.t === 'async') {
+        replace(existingState.r, state.r)
+      }
+      existingState.a?.abort()
+    }
 
     return state
   }
