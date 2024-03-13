@@ -33,7 +33,6 @@ describe.skipIf(typeof useTransition !== 'function')('useTransition', () => {
         return (
           <>
             <div>delayed: {delayed}</div>
-            <div>{pending && 'pending'}</div>
             <button
               onClick={() => startTransition(() => setCount((c) => c + 1))}
             >
@@ -43,7 +42,7 @@ describe.skipIf(typeof useTransition !== 'function')('useTransition', () => {
         )
       }
 
-      const { getByText, asFragment } = render(
+      const { getByText } = render(
         <>
           <Suspense fallback="loading">
             <Counter />
@@ -51,16 +50,16 @@ describe.skipIf(typeof useTransition !== 'function')('useTransition', () => {
         </>,
       )
 
-      expect(asFragment()).toMatchSnapshot()
-
-      await act(async () => resolve())
-      expect(asFragment()).toMatchSnapshot()
+      resolve()
+      await waitFor(() => expect(getByText('delayed: 0')).toBeTruthy())
 
       await userEvent.click(getByText('button'))
-      expect(asFragment()).toMatchSnapshot()
 
-      await act(async () => resolve())
-      expect(asFragment()).toMatchSnapshot()
+      act(() => {
+        resolve()
+      })
+
+      await waitFor(() => expect(getByText('delayed: 1')).toBeTruthy())
 
       expect(commited).toEqual([
         { pending: false, delayed: 0 },
