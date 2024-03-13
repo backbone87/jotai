@@ -205,10 +205,12 @@ export const createStore = (): Store => {
 
     const mount = mountMap.get(atom)
     if (mount !== undefined) {
+      console.log('changed mount', atom.debugLabel)
       scheduleFlush()
       changeSet.add(mount)
 
       for (const dependent of mount.t) {
+        console.log('dirty', dependent.debugLabel)
         dirtySet.add(dependent)
       }
     }
@@ -370,6 +372,7 @@ export const createStore = (): Store => {
   }
 
   const computeAtomState = <Value>(atom: Atom<Value>): AtomState<Value> => {
+    console.log('compute', atom.debugLabel)
     dirtySet.delete(atom)
 
     const obsoleteDeps = depsMap.get(atom)
@@ -580,7 +583,10 @@ export const createStore = (): Store => {
     scheduledFlush ??= ASYNC_WRITE.then(flush)
   }
 
+  let j = 0
   const flush = (type: FlushType): void => {
+    const i = j++
+    console.log(i, type)
     // make sure no new flushes are scheduled while flushing
     scheduledFlush ??= ASYNC_WRITE
 
@@ -590,7 +596,14 @@ export const createStore = (): Store => {
     }
 
     for (const mount of changeSet) {
+      for (const [a, m] of mountMap) {
+        if (m === mount) {
+          console.log(i, 'flush mount of', a.debugLabel)
+          break
+        }
+      }
       for (const atom of dirtySet) {
+        console.log(i, 'flush dirty', atom.debugLabel)
         computeAtomState(atom)
 
         if (import.meta.env?.MODE !== 'production') {
@@ -601,6 +614,11 @@ export const createStore = (): Store => {
       changeSet.delete(mount)
       mount.l.forEach(invoke)
     }
+    console.log(
+      i,
+      'flushed',
+      [...flushed!].map((a) => a.debugLabel),
+    )
 
     scheduledFlush = undefined
 
