@@ -1,5 +1,3 @@
-type AnyContext = Record<string, unknown>
-
 type Getter = <Value>(atom: Atom<Value>) => Value
 
 type Setter = <Value, Args extends unknown[], Result>(
@@ -14,16 +12,9 @@ type SetAtom<Args extends unknown[], Result> = <A extends Args>(
 /**
  * setSelf is for internal use only and subject to change without notice.
  */
-type Read<Value, SetSelf = never, Context extends AnyContext = AnyContext> = (
+type Read<Value, SetSelf = never> = (
   get: Getter,
-  options: {
-    readonly set: Setter
-    readonly getUntracked: Getter
-    readonly recompute: () => void
-    readonly signal: AbortSignal
-    readonly setSelf: SetSelf
-    readonly context: Context
-  },
+  options: { readonly signal: AbortSignal; readonly setSelf: SetSelf },
 ) => Value
 
 type Write<Args extends unknown[], Result> = (
@@ -46,11 +37,11 @@ type OnMount<Args extends unknown[], Result> = <
   setAtom: S,
 ) => OnUnmount | void
 
-export interface Atom<Value, Context extends AnyContext = AnyContext> {
+export interface Atom<Value> {
   toString: () => string
   is: typeof Object.is
   derived: boolean
-  read: Read<Value, never, Context>
+  read: Read<Value>
   debugLabel?: string
   /**
    * To ONLY be used by Jotai libraries to mark atoms as private. Subject to change.
@@ -59,13 +50,9 @@ export interface Atom<Value, Context extends AnyContext = AnyContext> {
   debugPrivate?: boolean
 }
 
-export interface WritableAtom<
-  Value,
-  Args extends unknown[],
-  Result,
-  Context extends AnyContext = AnyContext,
-> extends Atom<Value, Context> {
-  read: Read<Value, SetAtom<Args, Result>, Context>
+export interface WritableAtom<Value, Args extends unknown[], Result>
+  extends Atom<Value> {
+  read: Read<Value, SetAtom<Args, Result>>
   write: Write<Args, Result>
   onMount?: OnMount<Args, Result>
 }
@@ -81,20 +68,13 @@ export type PrimitiveAtom<Value> = WritableAtom<
 let keyCount = 0 // global key count for all atoms
 
 // writable derived atom
-export function atom<
-  Value,
-  Args extends unknown[],
-  Result,
-  Context extends AnyContext,
->(
-  read: Read<Value, SetAtom<NoInfer<Args>, NoInfer<Result>>, Context>,
+export function atom<Value, Args extends unknown[], Result>(
+  read: Read<Value, SetAtom<Args, Result>>,
   write: Write<Args, Result>,
 ): WritableAtom<Value, Args, Result>
 
 // read-only derived atom
-export function atom<Value, Context extends AnyContext = AnyContext>(
-  read: Read<Value, never, Context>,
-): Atom<Value>
+export function atom<Value>(read: Read<Value>): Atom<Value>
 
 // write-only derived atom
 export function atom<Value, Args extends unknown[], Result>(
@@ -107,13 +87,8 @@ export function atom<Value>(
   initialValue: Value,
 ): PrimitiveAtom<Value> & WithInitialValue<Value>
 
-export function atom<
-  Value,
-  Args extends unknown[],
-  Result,
-  Context extends AnyContext,
->(
-  initialValueOrRead: Value | Read<Value, SetAtom<Args, Result>, Context>,
+export function atom<Value, Args extends unknown[], Result>(
+  initialValueOrRead: Value | Read<Value, SetAtom<Args, Result>>,
   maybeWrite?: Write<Args, Result>,
 ): Atom<Value> | PrimitiveAtom<Value> | WritableAtom<Value, Args, Result> {
   type R = Read<Value, SetAtom<Args, Result>>
@@ -140,7 +115,7 @@ export function atom<
   return atom
 }
 
-function defaultRead<Value>(this: Atom<Value>, get: Getter): Value {
+function defaultRead<Value>(this: Atom<Value>, get: Getter) {
   return get(this)
 }
 
@@ -149,7 +124,7 @@ function defaultWrite<Value>(
   get: Getter,
   set: Setter,
   arg: SetStateAction<Value>,
-): void {
+) {
   return set(
     this,
     typeof arg === 'function'
@@ -157,5 +132,3 @@ function defaultWrite<Value>(
       : arg,
   )
 }
-
-type NoInfer<T> = [T][T extends any ? 0 : never]
