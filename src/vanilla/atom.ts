@@ -39,8 +39,6 @@ type OnMount<Args extends unknown[], Result> = <
 
 export interface Atom<Value> {
   toString: () => string
-  is: typeof Object.is
-  derived: boolean
   read: Read<Value>
   debugLabel?: string
   /**
@@ -88,31 +86,24 @@ export function atom<Value>(
 ): PrimitiveAtom<Value> & WithInitialValue<Value>
 
 export function atom<Value, Args extends unknown[], Result>(
-  initialValueOrRead: Value | Read<Value, SetAtom<Args, Result>>,
-  maybeWrite?: Write<Args, Result>,
-): Atom<Value> | PrimitiveAtom<Value> | WritableAtom<Value, Args, Result> {
-  type R = Read<Value, SetAtom<Args, Result>>
-
+  read: Value | Read<Value, SetAtom<Args, Result>>,
+  write?: Write<Args, Result>,
+) {
   const key = `atom${++keyCount}`
-
-  const toString = () => key
-  const is = Object.is
-  const derived = typeof initialValueOrRead === 'function'
-  const read: R = derived ? (initialValueOrRead as R) : defaultRead
-  let write:
-    | Write<Args, Result>
-    | Write<[SetStateAction<Value>], void>
-    | undefined = maybeWrite
-
-  if (!derived) {
-    write ??= defaultWrite
+  const config = {
+    toString: () => key,
+  } as WritableAtom<Value, Args, Result> & { init?: Value }
+  if (typeof read === 'function') {
+    config.read = read as Read<Value, SetAtom<Args, Result>>
+  } else {
+    config.init = read
+    config.read = defaultRead
+    config.write = defaultWrite as unknown as Write<Args, Result>
   }
-
-  const init: Value | undefined = derived ? undefined : initialValueOrRead
-
-  const atom = { toString, is, derived, read, write, init }
-
-  return atom
+  if (write) {
+    config.write = write
+  }
+  return config
 }
 
 function defaultRead<Value>(this: Atom<Value>, get: Getter) {

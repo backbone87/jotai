@@ -46,22 +46,13 @@ describe('[DEV-ONLY] dev-only methods', () => {
 
     const result = store.dev_get_mounted_atoms?.() || []
     expect(Array.from(result)).toStrictEqual([
+      { toString: expect.any(Function), read: expect.any(Function) },
       {
-        derived: true,
-        init: undefined,
-        is: expect.any(Function),
-        read: expect.any(Function),
         toString: expect.any(Function),
-        write: undefined,
-      },
-      {
-        debugLabel: 'countAtom',
-        derived: false,
         init: 0,
-        is: expect.any(Function),
         read: expect.any(Function),
-        toString: expect.any(Function),
         write: expect.any(Function),
+        debugLabel: 'countAtom',
       },
     ])
     unsub()

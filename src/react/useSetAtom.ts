@@ -26,7 +26,7 @@ export function useSetAtom<Value, Args extends unknown[], Result>(
   const store = useStore(options)
   const setAtom = useCallback(
     (...args: Args) => {
-      if (import.meta.env?.MODE !== 'production' && atom.write === undefined) {
+      if (import.meta.env?.MODE !== 'production' && !('write' in atom)) {
         // useAtom can pass non writable atom with wrong type assertion,
         // so we should check here.
         throw new Error('not writable atom')

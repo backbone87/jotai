@@ -27,33 +27,22 @@ it('creates atoms', () => {
   }).toMatchInlineSnapshot(`
     {
       "countAtom": {
-        "derived": false,
         "init": 0,
-        "is": [Function],
         "read": [Function],
         "toString": [Function],
         "write": [Function],
       },
       "decrementCountAtom": {
-        "derived": false,
         "init": null,
-        "is": [Function],
         "read": [Function],
         "toString": [Function],
         "write": [Function],
       },
       "doubledCountAtom": {
-        "derived": true,
-        "init": undefined,
-        "is": [Function],
         "read": [Function],
         "toString": [Function],
-        "write": undefined,
       },
       "sumCountAtom": {
-        "derived": true,
-        "init": undefined,
-        "is": [Function],
         "read": [Function],
         "toString": [Function],
         "write": [Function],
@@ -69,9 +58,7 @@ it('should let users mark atoms as private', () => {
   expect(internalAtom).toMatchInlineSnapshot(`
     {
       "debugPrivate": true,
-      "derived": false,
       "init": 0,
-      "is": [Function],
       "read": [Function],
       "toString": [Function],
       "write": [Function],

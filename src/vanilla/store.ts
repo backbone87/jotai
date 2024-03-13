@@ -104,6 +104,11 @@ const abortable = (abortable: any): Abortable | undefined => {
     : undefined
 }
 
+const hasInitialValue = <T extends Atom<AnyValue>>(
+  atom: T,
+): atom is T & (T extends Atom<infer Value> ? { init: Value } : never) =>
+  'init' in atom
+
 /**
  * Create a new store. Each store is an independent, isolated universe of atom
  * states.
@@ -192,7 +197,7 @@ export const createStore = (): Store => {
     if (
       existingState !== undefined &&
       (existingState.r.status === 'rejected') === reject &&
-      atom.is(existingState.v, value)
+      Object.is(existingState.v, value)
     ) {
       existingState.a?.abort()
       existingState.a = abort
@@ -334,10 +339,9 @@ export const createStore = (): Store => {
           return returnAtomValue(this.existingState)
         }
 
-        // TODO 0001 this makes "scan" atoms impossible
-        // if (this.atom.derived) {
-        //   throw new Error('Derived atoms can not read from themselves')
-        // }
+        if (!hasInitialValue(this.atom)) {
+          throw new Error('no atom init')
+        }
 
         return (this.atom as unknown as { init: Value }).init
       }
@@ -438,7 +442,7 @@ export const createStore = (): Store => {
         return writeAtomState(target, args)
       }
 
-      if (target.derived) {
+      if (!hasInitialValue(target)) {
         // technically possible but restricted as it may cause bugs
         throw new Error('Atom not writable')
       }
@@ -667,7 +671,7 @@ export const createStore = (): Store => {
 
         try {
           for (const [atom, value] of values) {
-            if (!atom.derived) {
+            if (hasInitialValue(atom)) {
               depsMap.set(atom, EMPTY_DEPS)
               setAtomState(atom, EMPTY_DEPS, undefined, false, value)
               depsMap.delete(atom)
