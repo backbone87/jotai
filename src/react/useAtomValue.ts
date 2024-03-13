@@ -1,43 +1,45 @@
 /// <reference types="react/experimental" />
 
-import ReactExports, {
-  useDebugValue,
-  useEffect,
-  useReducer,
-  useRef,
-} from 'react'
-import {
-  TrackedResource,
-  use as jotaiUse,
-  original,
-} from '../vanilla/internal.ts'
-import type { Atom, ExtractAtomValue, Store } from '../vanilla.ts'
+import ReactExports, { useDebugValue, useEffect, useReducer } from 'react'
+import type { ReducerWithoutAction } from 'react'
+import type { Atom, ExtractAtomValue } from '../vanilla.ts'
 import { useStore } from './Provider.ts'
 
-const use = ReactExports.use ?? jotaiUse
+type Store = ReturnType<typeof useStore>
 
-type Action<Value> = {
-  store: Store
-  atom: Atom<Value>
-  value: TrackedResource<Awaited<Value>>
-}
-type State<Value> = {
-  store: Store
-  atom: Atom<Value>
-  value: TrackedResource<Awaited<Value>>
-}
-type Reducer<Value> = (
-  prev: State<Value>,
-  action: Action<Value>,
-) => State<Value>
-type Initializer<Value> = (arg: undefined) => State<Value>
+const isPromiseLike = (x: unknown): x is PromiseLike<unknown> =>
+  typeof (x as any)?.then === 'function'
 
-type Instance<Value> = {
-  delay: number | undefined
-  timeout: ReturnType<typeof setTimeout> | undefined
-  reducer: Reducer<Value>
-  initializer: Initializer<Value>
-}
+const use =
+  ReactExports.use ||
+  (<T>(
+    promise: PromiseLike<T> & {
+      status?: 'pending' | 'fulfilled' | 'rejected'
+      value?: T
+      reason?: unknown
+    },
+  ): T => {
+    if (promise.status === 'pending') {
+      throw promise
+    } else if (promise.status === 'fulfilled') {
+      return promise.value as T
+    } else if (promise.status === 'rejected') {
+      throw promise.reason
+    } else {
+      promise.status = 'pending'
+      promise.then(
+        (v) => {
+          promise.status = 'fulfilled'
+          promise.value = v
+        },
+        (e) => {
+          promise.status = 'rejected'
+          promise.reason = e
+        },
+      )
+      throw promise
+    }
+  })
 
 type Options = Parameters<typeof useStore>[0] & {
   delay?: number
@@ -53,76 +55,52 @@ export function useAtomValue<AtomType extends Atom<any>>(
   options?: Options,
 ): Awaited<ExtractAtomValue<AtomType>>
 
-export function useAtomValue<Value>(
-  atom: Atom<Value>,
-  options?: Options,
-): Awaited<Value> {
+export function useAtomValue<Value>(atom: Atom<Value>, options?: Options) {
   const store = useStore(options)
-  const ref = useRef(undefined as unknown as Instance<Value>)
 
-  let instance = ref.current
-  if (instance === undefined) {
-    instance = {
-      delay: undefined,
-      timeout: undefined,
-      reducer: (prev, { store, atom, value }) => {
-        return prev.value === value &&
-          prev.atom === atom &&
-          prev.store === store
-          ? prev
-          : { store, atom, value }
+  const [[valueFromReducer, storeFromReducer, atomFromReducer], rerender] =
+    useReducer<
+      ReducerWithoutAction<readonly [Value, Store, typeof atom]>,
+      undefined
+    >(
+      (prev) => {
+        const nextValue = store.get(atom)
+        if (
+          Object.is(prev[0], nextValue) &&
+          prev[1] === store &&
+          prev[2] === atom
+        ) {
+          return prev
+        }
+        return [nextValue, store, atom]
       },
-      initializer: () => {
-        return { store, atom, value: store.resource(atom) }
-      },
-    }
+      undefined,
+      () => [store.get(atom), store, atom],
+    )
 
-    ref.current = instance
+  let value = valueFromReducer
+  if (storeFromReducer !== store || atomFromReducer !== atom) {
+    rerender()
+    value = store.get(atom)
   }
 
-  instance.delay = options?.delay
-  clearTimeout(instance.timeout)
-
-  const [state, update] = useReducer(
-    instance.reducer,
-    undefined,
-    instance.initializer,
-  )
-
-  let { value } = state
-  if (state.store !== store || state.atom !== atom) {
-    value = store.resource(atom)
-    update({ store, atom, value })
-  }
-
+  const delay = options?.delay
   useEffect(() => {
-    const instance = ref.current
-
     const unsub = store.sub(atom, () => {
-      if (instance.delay === undefined) {
-        return update({ store, atom, value: store.resource(atom) })
+      if (typeof delay === 'number') {
+        // delay rerendering to wait a promise possibly to resolve
+        setTimeout(rerender, delay)
+        return
       }
-
-      // delay rerendering to wait a promise possibly to resolve
-      clearTimeout(instance.timeout)
-      instance.timeout = setTimeout(
-        () => update({ store, atom, value: store.resource(atom) }),
-        instance.delay,
-      )
+      rerender()
     })
+    rerender()
+    return unsub
+  }, [store, atom, delay])
 
-    // in case a new resource was set before the effect was called and therefore
-    // before we subscribed `update` to the store we just run `update` now.
-    // it is a noop if `instance.resource` has not changed
-    update({ store, atom, value: store.resource(atom) })
-
-    return () => {
-      unsub()
-      clearTimeout(instance.timeout)
-    }
-  }, [store, atom])
-
-  useDebugValue(original(value))
-
-  return use(value)
+  useDebugValue(value)
+  // TS doesn't allow using `use` always.
+  // The use of isPromiseLike is to be consistent with `use` type.
+  // `instanceof Promise` actually works fine in this case.
+  return isPromiseLike(value) ? use(value) : (value as Awaited<Value>)
 }
