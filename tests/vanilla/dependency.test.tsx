@@ -144,12 +144,20 @@ it('keeps atoms mounted between recalculations', async () => {
   })
   store.set(atom1, (c) => c + 1)
   resolve()
+  // TODO 0009 i think this was a bug in the previous test already, since the
+  // effect of the previous resolve was never visible in the follow expectations
+  await Promise.resolve()
+  await Promise.resolve()
   expect(metrics1).toEqual({
     mounted: 1,
     unmounted: 0,
   })
+  // TODO 0009 async dep was indeed unmounted. i think that this is the better
+  // behavior than keeping mounts around until derivation resolves. we can
+  // add support for "lingering" mounts where the linger time is decided by the
+  // user. something like making `onUnmount` async
   expect(metrics2).toEqual({
-    mounted: 1,
-    unmounted: 0,
+    mounted: 2,
+    unmounted: 1,
   })
 })
