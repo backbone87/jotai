@@ -68,6 +68,17 @@ export function useAtomValue<Value>(
       delay: undefined,
       timeout: undefined,
       reducer: (prev, { store, atom, value }) => {
+        // TODO 0007 we moved the "continue promise" logic here
+        // - benefit: store keeps identity of promises that are not async
+        //   derivations
+        // - benefit: atoms that are not "useAtomValue"d do not run the proxying
+        //   code which may be cheaper
+        // - drawback: the store might run more derivations and subscribers
+        //   despite the observable state of an atom not changing (pending ->
+        //   pending) but only the identity of the promise.
+        // this can be moved back to the store fairly easily
+        // we could also introduce a utility á la `unwrap` to make "store-only"
+        // atoms be replaceable
         const nextValue = replace(prev.value, value)
 
         return prev.value === nextValue &&
@@ -77,8 +88,6 @@ export function useAtomValue<Value>(
           : { store, atom, value: nextValue }
       },
       initializer: () => {
-        // instance.initializer = undefined
-
         return { store, atom, value: replace(undefined, store.resource(atom)) }
       },
     }

@@ -1,7 +1,7 @@
 interface RawResource<T> {
   then<U, V>(
     onFulfill?: (value: T) => U | PromiseLike<U>,
-    onReject?: (error: unknown) => V | PromiseLike<V>
+    onReject?: (error: unknown) => V | PromiseLike<V>,
   ): PromiseLike<U | V>
 }
 
@@ -54,7 +54,7 @@ interface AnyResource<T> extends RawResource<T> {
 }
 
 function setupTracking<T, U>(
-  resource: AnyResource<T> & U
+  resource: AnyResource<T> & U,
 ): TrackedResource<T> & U {
   resource.status = 'pending'
   resource.then(
@@ -65,10 +65,56 @@ function setupTracking<T, U>(
     (reason) => {
       resource.status = 'rejected'
       resource.reason = reason
-    }
+    },
   )
 
   return resource as TrackedResource<T>
+}
+
+export function fulfilled<T>(value: T): FulfilledResource<T> {
+  return new ConcreteFulfilledResource(value)
+}
+
+class ConcreteFulfilledResource<T> implements FulfilledResource<T> {
+  public status = 'fulfilled' as const
+
+  public value: T
+
+  public reason = undefined
+
+  public constructor(value: T) {
+    this.value = value
+  }
+
+  public then<U, V>(
+    onFulfill?: (value: T) => U | PromiseLike<U>,
+    onReject?: (error: unknown) => V | PromiseLike<V>,
+  ): PromiseLike<U | V> {
+    return Promise.resolve(this.value).then(onFulfill, onReject)
+  }
+}
+
+export function rejected<T>(reason: unknown): RejectedResource<T> {
+  return new ConcreteRejectedResource(reason)
+}
+
+class ConcreteRejectedResource<T> implements RejectedResource<T> {
+  public status = 'rejected' as const
+
+  public value = undefined
+
+  public reason: unknown
+
+  public constructor(reason: unknown) {
+    this.reason = reason
+  }
+
+  public then<U, V>(
+    onFulfill?: (value: T) => U | PromiseLike<U>,
+    onReject?: (error: unknown) => V | PromiseLike<V>,
+  ): PromiseLike<U | V> {
+    return Promise.reject(this.value).then(onFulfill, onReject)
+  }
 }
 
 export function isResource<T, U>(value: Resource<T> | U): value is Resource<T> {
@@ -96,7 +142,7 @@ export function original<T>(gate: ReplaceableResource<T>): Resource<T> {
 
 export function replace<T>(
   gate: ReplaceableResource<T> | undefined,
-  resource: Resource<T>
+  resource: Resource<T>,
 ): ReplaceableResource<T> {
   if (gate === undefined) {
     return replaceable(resource)
@@ -111,6 +157,10 @@ export function replace<T>(
   }
 
   const nextGate = replaceable(resource)
+  if (nextGate[ORIGINAL] === gate[ORIGINAL]) {
+    return gate
+  }
+
   gate[RESOLVE](nextGate)
   gate[ORIGINAL] = nextGate[ORIGINAL]
   gate[RESOLVE] = nextGate[RESOLVE]
@@ -119,7 +169,7 @@ export function replace<T>(
 }
 
 function replaceable<T>(
-  resource: ReplaceableResource<T> | UntrackedResource<T>
+  resource: ReplaceableResource<T> | UntrackedResource<T>,
 ): ReplaceableResource<T> {
   if (resource.status === 'fulfilled' || resource.status === 'rejected') {
     return resource
@@ -135,9 +185,9 @@ function replaceable<T>(
       resolve = f
       resource.then(
         (value) => gate[RESOLVE] === f && (gate[RESOLVE] = f(value)),
-        (reason) => gate[RESOLVE] === f && (gate[RESOLVE] = r(reason))
+        (reason) => gate[RESOLVE] === f && (gate[RESOLVE] = r(reason)),
       )
-    })
+    }),
   ) as ReplaceableResource<T>
   gate[ORIGINAL] = resource
   // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- has definitely been assigned above
