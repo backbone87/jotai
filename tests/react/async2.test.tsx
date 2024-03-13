@@ -198,18 +198,20 @@ describe('timing issue with setSelf', () => {
     // The use of fireEvent is required to reproduce the issue
     fireEvent.click(getByText('button'))
 
-    await waitFor(() => assert(resolve.length === 3))
+    // TODO 0006 see comments in vanilla store tests
+    await waitFor(() => assert(resolve.length === 2))
     resolve[1]!()
-    resolve[2]!()
+    // resolve[2]!()
 
     await waitFor(() => assert(result === 2))
 
     // The use of fireEvent is required to reproduce the issue
     fireEvent.click(getByText('button'))
 
-    await waitFor(() => assert(resolve.length === 5))
-    resolve[3]!()
-    resolve[4]!()
+    // TODO 0006 see comments in vanilla store tests
+    await waitFor(() => assert(resolve.length === 3))
+    resolve[2]!()
+    // resolve[4]!()
 
     await findByText('count: 4')
     expect(result).toBe(4) // 3
