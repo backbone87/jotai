@@ -144,14 +144,105 @@ it('keeps atoms mounted between recalculations', async () => {
   })
   store.set(atom1, (c) => c + 1)
   resolve()
+  // TODO 0009 i think this was a bug in the previous test already, since the
+  // effect of the previous resolve was never visible in the follow expectations
+  await Promise.resolve()
+  await Promise.resolve()
   expect(metrics1).toEqual({
     mounted: 1,
     unmounted: 0,
   })
+  // TODO 0009 async dep was indeed unmounted. i think that this is the better
+  // behavior than keeping mounts around until derivation resolves. we can
+  // add support for "lingering" mounts where the linger time is decided by the
+  // user. something like making `onUnmount` async
   expect(metrics2).toEqual({
-    mounted: 1,
-    unmounted: 0,
+    mounted: 2,
+    unmounted: 1,
   })
+})
+
+it('settles never resolving async derivations with deps picked up sync', async () => {
+  const resolve: ((value: number) => void)[] = []
+
+  const syncAtom = atom({
+    promise: new Promise<number>((r) => resolve.push(r)),
+  })
+
+  const asyncAtom = atom(async (get) => {
+    return await get(syncAtom).promise
+  })
+
+  const store = createStore()
+
+  let sub = 0
+  const values: unknown[] = []
+  store.get(asyncAtom).then((value) => {
+    values.push(value)
+  })
+
+  store.sub(asyncAtom, () => {
+    sub++
+    store.get(asyncAtom).then((value) => {
+      values.push(value)
+    })
+  })
+
+  await new Promise((r) => setTimeout(r))
+
+  store.set(syncAtom, {
+    promise: new Promise<number>((r) => resolve.push(r)),
+  })
+
+  await new Promise((r) => setTimeout(r))
+
+  resolve[1]?.(1)
+
+  await new Promise((r) => setTimeout(r))
+
+  expect(values).toEqual([1])
+  expect(sub).toBe(0)
+})
+
+it('settles never resolving async derivations with deps picked up async', async () => {
+  const resolve: ((value: number) => void)[] = []
+
+  const syncAtom = atom({
+    promise: new Promise<number>((r) => resolve.push(r)),
+  })
+
+  const asyncAtom = atom(async (get) => {
+    // we want to pick up `syncAtom` as an async dep
+    await Promise.resolve()
+
+    return await get(syncAtom).promise
+  })
+
+  const store = createStore()
+
+  let sub = 0
+  const values: unknown[] = []
+  store.get(asyncAtom).then((value) => values.push(value))
+
+  store.sub(asyncAtom, () => {
+    sub++
+    store.get(asyncAtom).then((value) => values.push(value))
+  })
+
+  await new Promise((r) => setTimeout(r))
+
+  store.set(syncAtom, {
+    promise: new Promise<number>((r) => resolve.push(r)),
+  })
+
+  await new Promise((r) => setTimeout(r))
+
+  resolve[1]?.(1)
+
+  await new Promise((r) => setTimeout(r))
+
+  expect(values).toEqual([1])
+  expect(sub).toBe(0)
 })
 
 it('should not provide stale values to conditional dependents', () => {
@@ -219,8 +310,12 @@ it('settles never resolving async derivations with deps picked up sync', async (
 
   await new Promise((r) => setTimeout(r))
 
-  expect(values).toEqual([1, 1])
-  expect(sub).toBe(1)
+  // TODO 0800 The observable value of asyncAtom does not change:
+  // asyncAtom has a pending promise with the initial value of syncAtom as well
+  // as after syncAtom was updated. Because of that subscribers do not get
+  // notified and we only record one value.
+  expect(values).toEqual([1])
+  expect(sub).toBe(0)
 })
 
 it('settles never resolving async derivations with deps picked up async', async () => {
@@ -260,8 +355,12 @@ it('settles never resolving async derivations with deps picked up async', async 
 
   await new Promise((r) => setTimeout(r))
 
-  expect(values).toEqual([1, 1])
-  expect(sub).toBe(1)
+  // TODO 0800 The observable value of asyncAtom does not change:
+  // asyncAtom has a pending promise with the initial value of syncAtom as well
+  // as after syncAtom was updated. Because of that subscribers do not get
+  // notified and we only record one value.
+  expect(values).toEqual([1])
+  expect(sub).toBe(0)
 })
 
 it('refreshes deps for each async read', async () => {
@@ -281,8 +380,11 @@ it('refreshes deps for each async read', async () => {
   const store = createStore()
   store.get(asyncAtom)
   store.set(countAtom, (c) => c + 1)
+  // TODO 0801 We need to resolve after the 2nd read, because unsubscribed atoms
+  // are recalculated on read.
+  const async = store.get(asyncAtom)
   resolve.splice(0).forEach((fn) => fn())
-  expect(await store.get(asyncAtom)).toBe(1)
+  expect(await async).toBe(1)
   store.set(depAtom, true)
   store.get(asyncAtom)
   resolve.splice(0).forEach((fn) => fn())

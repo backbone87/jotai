@@ -1,49 +1,55 @@
 /// <reference types="react/experimental" />
 
-import ReactExports, { useDebugValue, useEffect, useReducer } from 'react'
-import type { ReducerWithoutAction } from 'react'
-import type { Atom, ExtractAtomValue } from '../vanilla.ts'
+import ReactExports, {
+  useDebugValue,
+  useEffect,
+  useReducer,
+  useRef,
+} from 'react'
+import {
+  type TrackedResource,
+  use as jotaiUse,
+  original,
+} from '../vanilla/internal.ts'
+import type { Atom, ExtractAtomValue, Store } from '../vanilla.ts'
 import { useStore } from './Provider.ts'
 
-type Store = ReturnType<typeof useStore>
+const use = ReactExports.use ?? jotaiUse
 
-const isPromiseLike = (x: unknown): x is PromiseLike<unknown> =>
-  typeof (x as any)?.then === 'function'
+type State<Value> = {
+  store: Store
+  atom: Atom<Value>
+  value: TrackedResource<Awaited<Value>>
+}
+type Initializer<Value> = (arg: undefined) => State<Value>
 
-const use =
-  ReactExports.use ||
-  (<T>(
-    promise: PromiseLike<T> & {
-      status?: 'pending' | 'fulfilled' | 'rejected'
-      value?: T
-      reason?: unknown
-    },
-  ): T => {
-    if (promise.status === 'pending') {
-      throw promise
-    } else if (promise.status === 'fulfilled') {
-      return promise.value as T
-    } else if (promise.status === 'rejected') {
-      throw promise.reason
-    } else {
-      promise.status = 'pending'
-      promise.then(
-        (v) => {
-          promise.status = 'fulfilled'
-          promise.value = v
-        },
-        (e) => {
-          promise.status = 'rejected'
-          promise.reason = e
-        },
-      )
-      throw promise
-    }
-  })
+type Instance<Value> = {
+  delay: number | undefined
+  timeout: ReturnType<typeof setTimeout> | undefined
+  unsub: (() => void) | void
+  initializer: Initializer<Value>
+}
+
+const reducer = <Value>(
+  prev: State<Value>,
+  next: State<Value>,
+): State<Value> => {
+  return prev.value === next.value &&
+    prev.atom === next.atom &&
+    prev.store === next.store
+    ? prev
+    : next
+}
+
+const noop = () => {}
 
 type Options = Parameters<typeof useStore>[0] & {
   delay?: number
 }
+
+const finalize = new FinalizationRegistry((instance: Instance<any>) => {
+  instance.unsub = instance.unsub?.()
+})
 
 export function useAtomValue<Value>(
   atom: Atom<Value>,
@@ -55,52 +61,94 @@ export function useAtomValue<AtomType extends Atom<unknown>>(
   options?: Options,
 ): Awaited<ExtractAtomValue<AtomType>>
 
-export function useAtomValue<Value>(atom: Atom<Value>, options?: Options) {
+export function useAtomValue<Value>(
+  atom: Atom<Value>,
+  options?: Options,
+): Awaited<Value> {
   const store = useStore(options)
+  const ref = useRef(undefined as unknown as Instance<Value>)
 
-  const [[valueFromReducer, storeFromReducer, atomFromReducer], rerender] =
-    useReducer<
-      ReducerWithoutAction<readonly [Value, Store, typeof atom]>,
-      undefined
-    >(
-      (prev) => {
-        const nextValue = store.get(atom)
-        if (
-          Object.is(prev[0], nextValue) &&
-          prev[1] === store &&
-          prev[2] === atom
-        ) {
-          return prev
+  let instance = ref.current
+  if (instance === undefined) {
+    instance = {
+      delay: undefined,
+      timeout: undefined,
+      unsub: undefined,
+      initializer: () => {
+        // we need to stop holding onto possibly outdated store and atom
+        // as long as react never calls the initializer for a reducer more than
+        // once for a single stable instance that is fine
+        instance.initializer = noop as unknown as Initializer<Value>
+
+        const value = store.resource(atom)
+        // since react 19, initializers of reducers are invoked twice in dev
+        // mode, so we additionally need to check if the "out of band"
+        // subscription already happened (this double execution happens in the
+        // same render, so the above is still fine)
+        // in the future we might get rid of this "hack" when react provides a
+        // way to track suspended components usages of promises as they already
+        // tried to do with the suspense cache
+        if (value.status === 'pending' && instance.unsub === undefined) {
+          instance.unsub = store.sub(atom, noop)
+          finalize.register(ref, instance, ref)
         }
-        return [nextValue, store, atom]
-      },
-      undefined,
-      () => [store.get(atom), store, atom],
-    )
 
-  let value = valueFromReducer
-  if (storeFromReducer !== store || atomFromReducer !== atom) {
-    rerender()
-    value = store.get(atom)
+        return { store, atom, value }
+      },
+    }
+
+    ref.current = instance
   }
 
-  const delay = options?.delay
-  useEffect(() => {
-    const unsub = store.sub(atom, () => {
-      if (typeof delay === 'number') {
-        // delay rerendering to wait a promise possibly to resolve
-        setTimeout(rerender, delay)
-        return
-      }
-      rerender()
-    })
-    rerender()
-    return unsub
-  }, [store, atom, delay])
+  instance.delay = options?.delay
+  clearTimeout(instance.timeout)
 
-  useDebugValue(value)
-  // TS doesn't allow using `use` always.
-  // The use of isPromiseLike is to be consistent with `use` type.
-  // `instanceof Promise` actually works fine in this case.
-  return isPromiseLike(value) ? use(value) : (value as Awaited<Value>)
+  const [state, update] = useReducer(
+    reducer<Value>,
+    undefined,
+    instance.initializer,
+  )
+
+  let { value } = state
+  if (state.store !== store || state.atom !== atom) {
+    value = store.resource(atom)
+    update({ store, atom, value })
+  }
+
+  useEffect(() => {
+    const instance = ref.current
+
+    const unsub = store.sub(atom, () => {
+      clearTimeout(instance.timeout)
+
+      if (instance.delay === undefined) {
+        return update({ store, atom, value: store.resource(atom) })
+      }
+
+      // delay rerendering to wait a promise possibly to resolve
+      instance.timeout = setTimeout(
+        () => update({ store, atom, value: store.resource(atom) }),
+        instance.delay,
+      )
+    })
+
+    if (instance.unsub !== undefined) {
+      finalize.unregister(ref)
+      instance.unsub = instance.unsub()
+    }
+
+    // in case a new resource was set before the effect was called and therefore
+    // before we subscribed `update` to the store we just run `update` now.
+    // it is a noop if `instance.resource` has not changed
+    update({ store, atom, value: store.resource(atom) })
+
+    return () => {
+      unsub()
+      clearTimeout(instance.timeout)
+    }
+  }, [store, atom])
+
+  useDebugValue(original(value))
+
+  return use(value)
 }

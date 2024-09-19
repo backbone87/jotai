@@ -66,8 +66,15 @@ export function atomWithObservable<Data>(
   getObservable: (get: Getter) => ObservableLike<Data> | SubjectLike<Data>,
   options?: Options<Data>,
 ) {
-  type Result = { d: Data } | { e: AnyError }
+  // TODO 0030 we need to keep the resultAtom sync so we wrap the promise
+  // this is necessary because pending promises that are replaced with a sync
+  // resource do not trigger downstream updates and the promise that was already
+  // read by dependents only resolves in the next microtask
+  type Result = { d: Data } | { e: AnyError } | { p: Promise<Data> }
   const returnResultData = (result: Result) => {
+    if ('p' in result) {
+      return result.p
+    }
     if ('e' in result) {
       throw result.e
     }
@@ -82,11 +89,15 @@ export function atomWithObservable<Data>(
     }
 
     let resolve: ((result: Result) => void) | undefined
-    const makePending = () =>
-      new Promise<Result>((r) => {
-        resolve = r
-      })
-    const initialResult: Result | Promise<Result> =
+    const makePending = (prev?: Result) =>
+      prev !== undefined && 'p' in prev
+        ? prev
+        : {
+            p: new Promise<Result>((r) => {
+              resolve = r
+            }).then(returnResultData),
+          }
+    const initialResult: Result =
       options && 'initialValue' in options
         ? {
             d:
@@ -162,18 +173,15 @@ export function atomWithObservable<Data>(
   const observableAtom = atom(
     (get) => {
       const [resultAtom] = get(observableResultAtom)
-      const result = get(resultAtom)
-      if (result instanceof Promise) {
-        return result.then(returnResultData)
-      }
-      return returnResultData(result)
+
+      return returnResultData(get(resultAtom))
     },
     (get, set, data: Data) => {
       const [resultAtom, observable, makePending, start, isNotMounted] =
         get(observableResultAtom)
       if ('next' in observable) {
         if (isNotMounted()) {
-          set(resultAtom, makePending())
+          set(resultAtom, makePending)
           start()
         }
         observable.next(data)

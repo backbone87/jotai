@@ -1,136 +1,53 @@
-import type { Atom, WritableAtom } from './atom.ts'
+import { type Atom, type WritableAtom } from './atom.ts'
+import {
+  type FulfilledResource,
+  type RejectedResource,
+  type Resource,
+  type TrackedResource,
+  isEqual,
+  read,
+  replace,
+  toRejected,
+  toResource,
+} from './internal.ts'
 
-type AnyValue = unknown
-type AnyError = unknown
-type AnyAtom = Atom<AnyValue>
-type AnyWritableAtom = WritableAtom<AnyValue, unknown[], unknown>
-type OnUnmount = () => void
-type Getter = Parameters<AnyAtom['read']>[0]
-type Setter = Parameters<AnyWritableAtom['write']>[1]
-
-const isSelfAtom = (atom: AnyAtom, a: AnyAtom): boolean =>
-  atom.unstable_is ? atom.unstable_is(a) : a === atom
-
-const hasInitialValue = <T extends Atom<AnyValue>>(
-  atom: T,
-): atom is T & (T extends Atom<infer Value> ? { init: Value } : never) =>
-  'init' in atom
-
-const isActuallyWritableAtom = (atom: AnyAtom): atom is AnyWritableAtom =>
-  !!(atom as AnyWritableAtom).write
-
-//
-// Continuable Promise
-//
-
-const CONTINUE_PROMISE = Symbol(
-  import.meta.env?.MODE !== 'production' ? 'CONTINUE_PROMISE' : '',
-)
-
-const PENDING = 'pending'
-const FULFILLED = 'fulfilled'
-const REJECTED = 'rejected'
-
-type ContinuePromise<T> = (
-  nextPromise: PromiseLike<T> | undefined,
-  nextAbort: () => void,
-) => void
-
-type ContinuablePromise<T> = Promise<T> &
-  (
-    | { status: typeof PENDING }
-    | { status: typeof FULFILLED; value?: T }
-    | { status: typeof REJECTED; reason?: AnyError }
-  ) & {
-    [CONTINUE_PROMISE]: ContinuePromise<T>
-  }
-
-const isContinuablePromise = (
-  promise: unknown,
-): promise is ContinuablePromise<AnyValue> =>
-  typeof promise === 'object' && promise !== null && CONTINUE_PROMISE in promise
-
-const continuablePromiseMap: WeakMap<
-  PromiseLike<AnyValue>,
-  ContinuablePromise<AnyValue>
-> = new WeakMap()
-
-/**
- * Create a continuable promise from a regular promise.
- */
-const createContinuablePromise = <T>(
-  promise: PromiseLike<T>,
-  abort: () => void,
-  complete: () => void,
-): ContinuablePromise<T> => {
-  if (!continuablePromiseMap.has(promise)) {
-    let continuePromise: ContinuePromise<T>
-    const p: any = new Promise((resolve, reject) => {
-      let curr = promise
-      const onFulfilled = (me: PromiseLike<T>) => (v: T) => {
-        if (curr === me) {
-          p.status = FULFILLED
-          p.value = v
-          resolve(v)
-          complete()
-        }
-      }
-      const onRejected = (me: PromiseLike<T>) => (e: AnyError) => {
-        if (curr === me) {
-          p.status = REJECTED
-          p.reason = e
-          reject(e)
-          complete()
-        }
-      }
-      promise.then(onFulfilled(promise), onRejected(promise))
-      continuePromise = (nextPromise, nextAbort) => {
-        if (nextPromise) {
-          continuablePromiseMap.set(nextPromise, p)
-          curr = nextPromise
-          nextPromise.then(onFulfilled(nextPromise), onRejected(nextPromise))
-
-          // Only abort promises that aren't user-facing. When nextPromise is set,
-          // we can replace the current promise with the next one, so we don't
-          // see any abort-related errors.
-          abort()
-          abort = nextAbort
-        }
-      }
-    })
-    p.status = PENDING
-    p[CONTINUE_PROMISE] = continuePromise!
-    continuablePromiseMap.set(promise, p)
-  }
-  return continuablePromiseMap.get(promise) as ContinuablePromise<T>
+export interface Store {
+  resource: <Value>(atom: Atom<Value>) => TrackedResource<Awaited<Value>>
+  get: <Value>(atom: Atom<Value>) => Value
+  set: <Value, Args extends unknown[], Result>(
+    atom: WritableAtom<Value, Args, Result>,
+    ...args: Args
+  ) => Result
+  sub: (atom: AnyAtom, subscriber: Subscriber) => Unsubscribe
+  reportError: typeof globalThis.reportError
+  unstable_derive: (fn: (...args: StoreArgs) => StoreArgs) => Store
 }
 
-const isPromiseLike = (x: unknown): x is PromiseLike<unknown> =>
-  typeof (x as any)?.then === 'function'
+type GetAtomState = <Value>(
+  atom: Atom<Value>,
+  originAtomState?: State,
+) => State<Value>
 
-/**
- * State tracked for mounted atoms. An atom is considered "mounted" if it has a
- * subscriber, or is a transitive dependency of another atom that has a
- * subscriber.
- *
- * The mounted state of an atom is freed once it is no longer mounted.
- */
-type Mounted = {
-  /** Set of listeners to notify when the atom value changes. */
-  readonly l: Set<() => void>
-  /** Set of mounted atoms that the atom depends on. */
-  readonly d: Set<AnyAtom>
-  /** Set of mounted atoms that depends on the atom. */
-  readonly t: Set<AnyAtom>
-  /** Function to run when the atom is unmounted. */
-  u?: OnUnmount
+// internal & unstable type
+type StoreArgs = readonly [
+  getAtomState: GetAtomState,
+  // possible other arguments in the future
+]
+
+// for debugging purpose only
+interface DevStore extends Store {
+  dev4_get_internal_weak_map: () => {
+    get: (atom: AnyAtom) => LegacyState | undefined
+  }
+  dev4_get_mounted_atoms?: () => Iterable<AnyAtom>
+  dev4_restore_atoms?: (values: Iterable<readonly [AnyAtom, AnyValue]>) => void
 }
 
 /**
  * Mutable atom state,
  * tracked for both mounted and unmounted atoms in a store.
  */
-type AtomState<Value = AnyValue> = {
+type LegacyState<Value = AnyValue> = {
   /**
    * Map of atoms that the atom depends on.
    * The map value is the epoch number of the dependency.
@@ -145,650 +62,993 @@ type AtomState<Value = AnyValue> = {
   /** The epoch number of the atom. */
   n: number
   /** Object to store mounted state of the atom. */
-  m?: Mounted // only available if the atom is mounted
+  m?: LegacyMount | undefined // only available if the atom is mounted
   /** Atom value */
-  v?: Value
+  v?: Value | undefined
   /** Atom error */
-  e?: AnyError
+  e?: AnyError | undefined
 }
 
-const isAtomStateInitialized = <Value>(atomState: AtomState<Value>) =>
-  'v' in atomState || 'e' in atomState
-
-const returnAtomValue = <Value>(atomState: AtomState<Value>): Value => {
-  if ('e' in atomState) {
-    throw atomState.e
-  }
-  if (import.meta.env?.MODE !== 'production' && !('v' in atomState)) {
-    throw new Error('[Bug] atom state is not initialized')
-  }
-  return atomState.v!
+/**
+ * State tracked for mounted atoms. An atom is considered "mounted" if it has a
+ * subscriber, or is a transitive dependency of another atom that has a
+ * subscriber.
+ *
+ * The mounted state of an atom is freed once it is no longer mounted.
+ */
+type LegacyMount = {
+  /** Set of listeners to notify when the atom value changes. */
+  readonly l: Set<() => void>
+  /** Set of mounted atoms that the atom depends on. */
+  readonly d: Set<AnyAtom>
+  /** Set of mounted atoms that depends on the atom. */
+  readonly t: Set<AnyAtom>
+  /** Function to run when the atom is unmounted. */
+  u?: OnUnmount | undefined
 }
 
-const getPendingContinuablePromise = (atomState: AtomState) => {
-  const value: unknown = atomState.v
-  if (isContinuablePromise(value) && value.status === PENDING) {
-    return value
-  }
-  return null
+export type INTERNAL_DevStoreRev4 = DevStore
+export type INTERNAL_PrdStore = Store
+
+const SUBSCRIBER_INDEX = Symbol('SUBSCRIBER_INDEX')
+
+type AnyValue = unknown
+type AnyError = unknown
+type AnyContext = Record<string, unknown>
+type AnyAtom = Atom<AnyValue>
+type AnyWritableAtom = WritableAtom<AnyValue, unknown[], unknown>
+type Subscriber = () => void
+interface WithSubscriberIndex {
+  [SUBSCRIBER_INDEX]: number | undefined
+}
+type Unsubscribe = () => void
+type OnMount = NonNullable<AnyWritableAtom['onMount']>
+type OnUnmount = Exclude<ReturnType<OnMount>, void>
+type Getter = Parameters<AnyAtom['read']>[0]
+type Setter = Parameters<AnyWritableAtom['write']>[1]
+type Epoch = number
+
+const FLAGS_ALL = 0b0000000_1111_1111
+/** Pushed by a setter so must increment epoch when resource changed */
+const FLAGS_SET_PUSH = 0b00_0000_0001
+/** Next pull must push */
+const FLAGS_DIRTY = 0b00000_0000_0010
+/** Next pull must check upstream even if mounted */
+const FLAGS_PENDING = 0b000_0000_0100
+/** Has (transitive) subscribers */
+const FLAGS_MOUNTED = 0b000_0000_1000
+
+/** Queued in `unpulled` to pull on next flush */
+const FLAGS_UNPULLED = 0b00_0001_0000
+/** Queued in `unmounted` to run `onUnmount` on next flush */
+const FLAGS_UNMOUNTED = 0b0_0010_0000
+/** Queued in `changed` to notify subscribers on next flush */
+const FLAGS_CHANGED = 0b000_0100_0000
+
+const FLAGS_PUSH_STEP = 0b1_0000_0000
+
+/**
+ * A state is weakly tracked for each atom within each store it is or has been
+ * used in.
+ */
+type State<TValue = AnyValue> = {
+  // TODO 0040 is it ok to strongly hold onto an atom while its derivation
+  // is running? -> Testing says yes
+  atom: Atom<TValue>
+  /**
+   * The LSB contains multiple flags about this state (see above).
+   * The rest of the bits are used as a push counter to tell apart concurrent
+   * pushes which can happen on re-pushes or async pushes.
+   */
+  flags: number
+  /**
+   * The epoch where the current resource was set. It represents the resource
+   * version and is used in the upstream.
+   */
+  low: Epoch
+  /**
+   * The epoch where the upstream was last pulled. It is guaranteed that this
+   * state is up to date when the epoch is less than or equal to `high`.
+   */
+  high: Epoch
+  init: TrackedResource<Awaited<TValue>>
+  resource: TrackedResource<Awaited<TValue>>
+  ctrl: AbortController | undefined
+  context: AnyContext | undefined
+  upSize: number
+  /**
+   * List of upstream states _this_ state depends on in the order they were
+   * read during the most recent computation.
+   */
+  upStates: State[] | undefined
+  /**
+   * Positions of _this_ state in the `downStates` list of each state in
+   * `upStates`.
+   *
+   * Invariant: Must have same order and length as `upStates`
+   */
+  upBackLinks: number[] | undefined
+  /**
+   * Epochs of each state in `upStates` at the time they were read during the
+   * last computation.
+   *
+   * Invariant: Must have same order and length as `upStates`
+   */
+  upEpochs: Epoch[] | undefined
+  /**
+   * List of mounted downstream states depending on _this_ state.
+   */
+  downStates: StateWithUpstream[] | undefined
+  /**
+   * Positions of _this_ state in the `upStates` list of each state in
+   * `downStates`.
+   *
+   * Invariant: Must have same order and length as `downStates`
+   */
+  downBackLinks: number[] | undefined
+  subscribers: Subscriber[] | undefined
+  unsubscribes: (Unsubscribe & WithSubscriberIndex)[] | undefined
+  /** Function to run when the atom is unmounted. */
+  onUnmount: OnUnmount | void
 }
 
-const addPendingContinuablePromiseToDependency = (
-  atom: AnyAtom,
-  promise: ContinuablePromise<AnyValue> & { status: typeof PENDING },
-  dependencyAtomState: AtomState,
-) => {
-  if (!dependencyAtomState.p.has(atom)) {
-    dependencyAtomState.p.add(atom)
-    promise.then(
-      () => {
-        dependencyAtomState.p.delete(atom)
-      },
-      () => {
-        dependencyAtomState.p.delete(atom)
-      },
-    )
+type StateWithUpstream<TValue = AnyValue> = State<TValue> &
+  Record<'upStates' | 'upBackLinks' | 'upEpochs', object>
+function assertUpstream<TValue>(
+  downState: State<TValue>,
+): asserts downState is StateWithUpstream<TValue> {
+  if (downState.upStates === undefined) {
+    downState.upStates = []
+    downState.upBackLinks = []
+    downState.upEpochs = []
+  }
+}
+function hasUpstream<TValue>(
+  downState: State<TValue>,
+): downState is StateWithUpstream<TValue> {
+  return downState.upStates !== undefined && downState.upStates.length > 0
+}
+function addUpstream(
+  downState: StateWithUpstream,
+  upLink: number,
+  upState: State,
+): void {
+  downState.upStates[upLink] = upState
+  downState.upBackLinks[upLink] ??= 0
+  downState.upEpochs[upLink] = upState.high
+}
+function truncateUpstream(
+  downState: StateWithUpstream,
+  stateUnmount: (state: State) => void,
+): void {
+  const { upSize, upStates, upBackLinks, upEpochs } = downState
+  for (let upLink = upStates.length - 1; upLink >= upSize; upLink--) {
+    const upState = upStates[upLink]!
+    if (hasDownstream(upState)) {
+      deleteDownstream(downState, upLink, upState)
+      stateUnmount(upState)
+    }
+
+    upStates.pop()
+    upBackLinks.pop()
+    upEpochs.pop()
   }
 }
 
-const addDependency = <Value>(
-  pending: Pending | undefined,
-  atom: Atom<Value>,
-  atomState: AtomState<Value>,
-  a: AnyAtom,
-  aState: AtomState,
-) => {
-  if (import.meta.env?.MODE !== 'production' && a === atom) {
-    throw new Error('[Bug] atom cannot depend on itself')
+type StateWithDownstream<TValue = AnyValue> = State<TValue> &
+  Record<'downStates' | 'downBackLinks', object>
+function assertDownstream<TValue>(
+  upState: State<TValue>,
+): asserts upState is StateWithDownstream<TValue> {
+  if (upState.downStates === undefined) {
+    upState.downStates = []
+    upState.downBackLinks = []
   }
-  atomState.d.set(a, aState.n)
-  const continuablePromise = getPendingContinuablePromise(atomState)
-  if (continuablePromise) {
-    addPendingContinuablePromiseToDependency(atom, continuablePromise, aState)
+}
+function hasDownstream<TValue>(
+  upState: State<TValue>,
+): upState is StateWithDownstream<TValue> {
+  return upState.downStates !== undefined && upState.downStates.length > 0
+}
+function addDownstream(
+  downState: StateWithUpstream,
+  upLink: number,
+  upState: StateWithDownstream,
+): void {
+  downState.upBackLinks[upLink] = upState.downStates.length
+  upState.downStates.push(downState)
+  upState.downBackLinks.push(upLink)
+}
+function deleteDownstream(
+  downState: StateWithUpstream,
+  upLink: number,
+  upState: StateWithDownstream,
+): void {
+  const { downStates, downBackLinks } = upState
+
+  // "move" the downstream at end of the list into our position unless we are at
+  // the end ourselves
+  const downLink = downState.upBackLinks[upLink]!
+  const lastDownLink = downStates.length - 1
+  if (downLink < lastDownLink) {
+    const lastDownState = downStates[lastDownLink]!
+    const lastUpLink = downBackLinks[lastDownLink]!
+    downStates[downLink] = lastDownState
+    downBackLinks[downLink] = lastUpLink
+    lastDownState.upBackLinks[lastUpLink] = downLink
   }
-  aState.m?.t.add(atom)
-  if (pending) {
-    addPendingDependent(pending, a, atom)
+
+  downStates.pop()
+  downBackLinks.pop()
+}
+function markDownstreamPending(
+  unpulled: State[],
+  upState: StateWithDownstream,
+): void {
+  const { downStates, downBackLinks } = upState
+  const { length } = downStates
+  for (let downLink = 0; downLink < length; downLink++) {
+    const downState = downStates[downLink]!
+
+    // We do not mark a downstream pending that is already
+    if (downState.flags & FLAGS_PENDING) {
+      continue
+    }
+    // We do not mark a downstream where we as an upstream are out of bounds.
+    // This can happen when we are pulled during a push of the downstream (or
+    // a transitive downstream). In this case we are an upstream of a previous
+    // push of the downstream and either have not yet been picked up again in
+    // the currently ongoing push or will be truncated
+    if (downState.upSize <= downBackLinks[downLink]!) {
+      continue
+    }
+    downState.flags |= FLAGS_PENDING
+
+    if (hasDownstream(downState)) {
+      markDownstreamPending(unpulled, downState)
+    }
+
+    // we append ourselves to `unpulled` after downstream because `unpulled`
+    // is processed in reverse
+    if (!(downState.flags & FLAGS_UNPULLED) && hasSubscribers(downState)) {
+      downState.flags |= FLAGS_UNPULLED
+      unpulled.push(downState)
+    }
   }
 }
 
-//
-// Pending
-//
-
-type Pending = readonly [
-  dependents: Map<AnyAtom, Set<AnyAtom>>,
-  atomStates: Map<AnyAtom, AtomState>,
-  functions: Set<() => void>,
-]
-
-const createPending = (): Pending => [new Map(), new Map(), new Set()]
-
-const addPendingAtom = (
-  pending: Pending,
-  atom: AnyAtom,
-  atomState: AtomState,
-) => {
-  if (!pending[0].has(atom)) {
-    pending[0].set(atom, new Set())
-  }
-  pending[1].set(atom, atomState)
-}
-
-const addPendingDependent = (
-  pending: Pending,
-  atom: AnyAtom,
-  dependent: AnyAtom,
-) => {
-  const dependents = pending[0].get(atom)
-  if (dependents) {
-    dependents.add(dependent)
+type StateWithSubscribers<TValue = AnyValue> = State<TValue> &
+  Record<'subscribers' | 'unsubscribes', object>
+function assertSubscribers<TValue>(
+  state: State<TValue>,
+): asserts state is StateWithSubscribers<TValue> {
+  if (state.subscribers === undefined) {
+    state.subscribers = []
+    state.unsubscribes = []
   }
 }
-
-const getPendingDependents = (pending: Pending, atom: AnyAtom) =>
-  pending[0].get(atom)
-
-const addPendingFunction = (pending: Pending, fn: () => void) => {
-  pending[2].add(fn)
+function hasSubscribers<TValue>(
+  state: State<TValue>,
+): state is StateWithSubscribers<TValue> {
+  return state.subscribers !== undefined && state.subscribers.length > 0
 }
 
-const flushPending = (pending: Pending) => {
-  while (pending[1].size || pending[2].size) {
-    pending[0].clear()
-    const atomStates = new Set(pending[1].values())
-    pending[1].clear()
-    const functions = new Set(pending[2])
-    pending[2].clear()
-    atomStates.forEach((atomState) => atomState.m?.l.forEach((l) => l()))
-    functions.forEach((fn) => fn())
-  }
+const toCtrl = (ctrl: any): AbortController | undefined => {
+  return ctrl instanceof AbortController ? ctrl : undefined
 }
 
-type GetAtomState = <Value>(
-  atom: Atom<Value>,
-  originAtomState?: AtomState,
-) => AtomState<Value>
-
-// internal & unstable type
-type StoreArgs = readonly [
-  getAtomState: GetAtomState,
-  // possible other arguments in the future
-]
-
-// for debugging purpose only
-type DevStoreRev4 = {
-  dev4_get_internal_weak_map: () => {
-    get: (atom: AnyAtom) => AtomState | undefined
-  }
-  dev4_get_mounted_atoms: () => Set<AnyAtom>
-  dev4_restore_atoms: (values: Iterable<readonly [AnyAtom, AnyValue]>) => void
+type StateWithOnMount<TValue = AnyValue> = State<TValue> & {
+  atom: WritableAtom<TValue, unknown[], unknown> & { onMount: OnMount }
+}
+const isStateWithOnMount = <TValue>(
+  state: State<TValue> & { atom: Atom<TValue> & { onMount?: OnMount } },
+): state is StateWithOnMount<TValue> => {
+  return state.atom.onMount !== undefined
 }
 
-type PrdStore = {
-  get: <Value>(atom: Atom<Value>) => Value
-  set: <Value, Args extends unknown[], Result>(
-    atom: WritableAtom<Value, Args, Result>,
-    ...args: Args
-  ) => Result
-  sub: (atom: AnyAtom, listener: () => void) => () => void
-  unstable_derive: (fn: (...args: StoreArgs) => StoreArgs) => Store
-}
+export const createStore = (): Store | DevStore => {
+  /**
+   * The epoch of the store is incremented each time a resource was pushed to
+   * a state and the following conditions are met:
+   * - The atom of the state is writable
+   * - The existing resource is not pending anymore and can therefore not be
+   *   replaced
+   * - The resource is different from the state's existing resource according to
+   *   the `is` method of the state's atom
+   */
+  let epoch: Epoch = 0
 
-type Store = PrdStore | (PrdStore & DevStoreRev4)
+  const states = new WeakMap<AnyAtom, State>()
 
-export type INTERNAL_DevStoreRev4 = DevStoreRev4
-export type INTERNAL_PrdStore = PrdStore
-
-const buildStore = (getAtomState: StoreArgs[0]): Store => {
-  // for debugging purpose only
-  let debugMountedAtoms: Set<AnyAtom>
-
+  let mountedStates: Set<State>
   if (import.meta.env?.MODE !== 'production') {
-    debugMountedAtoms = new Set()
+    mountedStates = new Set()
   }
 
-  const setAtomStateValueOrPromise = (
-    atom: AnyAtom,
-    atomState: AtomState,
-    valueOrPromise: unknown,
-    abortPromise = () => {},
-    completePromise = () => {},
-  ) => {
-    const hasPrevValue = 'v' in atomState
-    const prevValue = atomState.v
-    const pendingPromise = getPendingContinuablePromise(atomState)
-    if (isPromiseLike(valueOrPromise)) {
-      if (pendingPromise) {
-        if (pendingPromise !== valueOrPromise) {
-          pendingPromise[CONTINUE_PROMISE](valueOrPromise, abortPromise)
-          ++atomState.n
-        }
-      } else {
-        const continuablePromise = createContinuablePromise(
-          valueOrPromise,
-          abortPromise,
-          completePromise,
-        )
-        if (continuablePromise.status === PENDING) {
-          for (const a of atomState.d.keys()) {
-            addPendingContinuablePromiseToDependency(
-              atom,
-              continuablePromise,
-              getAtomState(a, atomState),
-            )
-          }
-        }
-        atomState.v = continuablePromise
-        delete atomState.e
+  /**
+   * Returns the atom's state initializing it if necessary.
+   */
+  const stateGet = <TValue>(
+    atom: Atom<TValue> & { init?: Awaited<TValue> | Resource<Awaited<TValue>> },
+  ): State<TValue> => {
+    let state = states.get(atom) as State<TValue> | undefined
+    if (state === undefined) {
+      // TODO 0001 this makes "scan" atoms impossible
+      // if (atom.derived) {
+      //   throw new Error('Derived atoms can not read from themselves')
+      // }
+
+      const init = toResource(atom.init!)
+      state = {
+        atom: atom,
+        flags: FLAGS_DIRTY,
+        low: epoch,
+        high: epoch,
+        init,
+        resource: init,
+        ctrl: undefined,
+        context: undefined,
+        upSize: 0,
+        upStates: undefined,
+        upBackLinks: undefined,
+        upEpochs: undefined,
+        downStates: undefined,
+        downBackLinks: undefined,
+        subscribers: undefined,
+        unsubscribes: undefined,
+        onUnmount: undefined,
       }
-    } else {
-      if (pendingPromise) {
-        pendingPromise[CONTINUE_PROMISE](
-          Promise.resolve(valueOrPromise),
-          abortPromise,
-        )
-      }
-      atomState.v = valueOrPromise
-      delete atomState.e
+
+      states.set(atom, state)
     }
-    if (!hasPrevValue || !Object.is(prevValue, atomState.v)) {
-      ++atomState.n
-    }
+
+    return state
   }
 
-  const readAtomState = <Value>(
-    pending: Pending | undefined,
-    atom: Atom<Value>,
-    atomState: AtomState<Value>,
-    force?: (a: AnyAtom) => boolean,
-  ): AtomState<Value> => {
-    // See if we can skip recomputing this atom.
-    if (!force?.(atom) && isAtomStateInitialized(atomState)) {
-      // If the atom is mounted, we can use the cache.
-      // because it should have been updated by dependencies.
-      if (atomState.m) {
-        return atomState
-      }
-      // Otherwise, check if the dependencies have changed.
-      // If all dependencies haven't changed, we can use the cache.
-      if (
-        Array.from(atomState.d).every(
-          ([a, n]) =>
-            // Recursively, read the atom state of the dependency, and
-            // check if the atom epoch number is unchanged
-            readAtomState(pending, a, getAtomState(a, atomState), force).n ===
-            n,
-        )
-      ) {
-        return atomState
-      }
+  /**
+   * Updates the state's resource with the given one. The existing resource
+   * might be kept if the new resource is equal or if the existing resource was
+   * pending and can be "redirected" to the new resource. If this is the case
+   * then no downstream notifications are scheduled.
+   *
+   * The deps of the new resource's derivation should be set in the state before
+   * calling this method.
+   */
+  const statePush = <TValue>(
+    state: State<TValue>,
+    ctrl?: AbortController,
+  ): void => {
+    state.flags += FLAGS_PUSH_STEP
+    const version = state.flags | FLAGS_ALL
+
+    // abort the previous computation
+    // this could re-push which we will check below
+    // we also set our `ctrl` so re-pushes can cancel us
+    const prevCtrl = state.ctrl
+    state.ctrl = ctrl
+    prevCtrl?.abort()
+
+    // when the version is smaller than the flags then we were re-pushed
+    if (version < state.flags) {
+      return
     }
-    // Compute a new state for this atom.
-    atomState.d.clear()
-    let isSync = true
-    const getter: Getter = <V>(a: Atom<V>) => {
-      if (isSelfAtom(atom, a)) {
-        const aState = getAtomState(a, atomState)
-        if (!isAtomStateInitialized(aState)) {
-          if (hasInitialValue(a)) {
-            setAtomStateValueOrPromise(a, aState, a.init)
-          } else {
-            // NOTE invalid derived atoms can reach here
-            throw new Error('no atom init')
-          }
-        }
-        return returnAtomValue(aState)
-      }
-      // a !== atom
-      const aState = readAtomState(
-        pending,
-        a,
-        getAtomState(a, atomState),
-        force,
-      )
-      if (isSync) {
-        addDependency(pending, atom, atomState, a, aState)
-      } else {
-        const pending = createPending()
-        addDependency(pending, atom, atomState, a, aState)
-        mountDependencies(pending, atom, atomState)
-        flushPending(pending)
-      }
-      return returnAtomValue(aState)
-    }
-    let controller: AbortController | undefined
-    let setSelf: ((...args: unknown[]) => unknown) | undefined
-    const options = {
-      get signal() {
-        if (!controller) {
-          controller = new AbortController()
-        }
-        return controller.signal
-      },
-      get setSelf() {
-        if (
-          import.meta.env?.MODE !== 'production' &&
-          !isActuallyWritableAtom(atom)
-        ) {
-          console.warn('setSelf function cannot be used with read-only atom')
-        }
-        if (!setSelf && isActuallyWritableAtom(atom)) {
-          setSelf = (...args) => {
-            if (import.meta.env?.MODE !== 'production' && isSync) {
-              console.warn('setSelf function cannot be called in sync')
-            }
-            if (!isSync) {
-              return writeAtom(atom, ...args)
-            }
-          }
-        }
-        return setSelf
-      },
-    }
+
+    state.flags &= ~FLAGS_DIRTY
+    state.upSize = 0
+
+    let resource: State<TValue>['resource']
     try {
-      const valueOrPromise = atom.read(getter, options as never)
-      setAtomStateValueOrPromise(
-        atom,
-        atomState,
-        valueOrPromise,
-        () => controller?.abort(),
-        () => {
-          if (atomState.m) {
-            const pending = createPending()
-            mountDependencies(pending, atom, atomState)
-            flushPending(pending)
+      const push = new Push(state, version)
+      resource = toResource(state.atom.read(push.get, push))
+    } catch (reason) {
+      // TODO 0013 someone could have thrown a promise in a sync derivation
+      // how should we handle this?
+
+      resource = toRejected(reason)
+    }
+
+    // reading the atom could have re-pushed during onMount of upstream
+    if (version < state.flags) {
+      return
+    }
+
+    if (resource.status === 'rejected') {
+      state.ctrl?.abort()
+      state.ctrl = undefined
+    }
+
+    if (hasUpstream(state)) {
+      truncateUpstream(state, stateUnmount)
+    }
+
+    state.flags &= ~FLAGS_PENDING
+
+    if (
+      state.resource === replace(state.resource, resource) ||
+      isEqual(state.resource, resource, state.atom)
+    ) {
+      state.flags &= ~FLAGS_SET_PUSH
+      state.high = epoch
+      state.init = state.resource
+
+      // in case we replaced with a sync resource then we need to update the
+      // existing resource's tracking information. an existing sync resource
+      // does not do this by itself. an existing async resource would do it by
+      // itself in the next microtask but this is too slow for us since someone
+      // could access this atom in sync and then it should behave like the new
+      // state
+      if (resource.status === 'fulfilled') {
+        state.resource.status = 'fulfilled'
+        ;(state.resource as FulfilledResource<Awaited<TValue>>).value =
+          resource.value
+        state.resource.sync = true
+      } else if (resource.status === 'rejected') {
+        state.resource.status = 'rejected'
+        ;(state.resource as RejectedResource<Awaited<TValue>>).reason =
+          resource.reason
+        state.resource.sync = true
+      }
+
+      return
+    }
+
+    // apply the new resource
+    epoch += state.flags & FLAGS_SET_PUSH
+    state.flags &= ~FLAGS_SET_PUSH
+    state.low = epoch
+    state.high = epoch
+    state.init = resource
+    state.resource = resource
+
+    // when we are not mounted we do not need to walk the downstream graph
+    if (!(state.flags & FLAGS_MOUNTED)) {
+      return
+    }
+
+    if (!(state.flags & FLAGS_CHANGED) && hasSubscribers(state)) {
+      state.flags |= FLAGS_CHANGED
+      changed.push(state)
+    }
+
+    if (!hasDownstream(state)) {
+      return
+    }
+
+    const { downStates, downBackLinks } = state
+    const { length } = downStates
+    for (let downLink = 0; downLink < length; downLink++) {
+      const downState = downStates[downLink]!
+
+      // We do not mark a downstream where we as an upstream are out of bounds.
+      // This can happen when we are pulled during a push of the downstream (or
+      // a transitive downstream). In this case we are an upstream of a previous
+      // push of the downstream and either have not yet been picked up again in
+      // the currently ongoing push or will be truncated
+      if (downState.upSize <= downBackLinks[downLink]!) {
+        continue
+      }
+      downState.flags |= FLAGS_DIRTY
+
+      // We do not mark a downstream pending that is already
+      if (downState.flags & FLAGS_PENDING) {
+        continue
+      }
+      downState.flags |= FLAGS_PENDING
+
+      if (hasDownstream(downState)) {
+        markDownstreamPending(unpulled, downState)
+      }
+
+      // we append ourselves to `unpulled` after downstream because `unpulled`
+      // is processed in reverse
+      if (!(downState.flags & FLAGS_UNPULLED) && hasSubscribers(downState)) {
+        downState.flags |= FLAGS_UNPULLED
+        unpulled.push(downState)
+      }
+    }
+  }
+
+  class Push<TValue> {
+    public constructor(
+      private readonly state: State<TValue>,
+      private readonly version: number,
+    ) {}
+
+    public get: Getter = <TUpValue>(upAtom: Atom<TUpValue>): TUpValue => {
+      const { state, version } = this
+      if ((upAtom as unknown as Atom<TValue>) === state.atom) {
+        return read(state.init) as TUpValue
+      }
+
+      const upState = stateGet(upAtom)
+
+      track: {
+        if (version < state.flags) {
+          // TODO 0100 maybe inconsistent read, should we throw?
+          statePull(upState)
+
+          break track
+        }
+
+        assertUpstream(state)
+
+        const { upSize } = state
+        const staleUpState = state.upStates[upSize]
+        addUpstream(state, upSize, upState)
+
+        if (!(state.flags & FLAGS_MOUNTED)) {
+          statePull(upState)
+
+          state.upSize++
+
+          break track
+        }
+
+        if (staleUpState !== undefined && staleUpState !== upState) {
+          assertDownstream(staleUpState)
+          deleteDownstream(state, upSize, staleUpState)
+          stateUnmount(staleUpState)
+        }
+
+        stateMountAndPull(upState)
+        // mounting could have re-pushed this state
+        if (version < state.flags) {
+          break track
+        }
+
+        if (staleUpState !== upState) {
+          assertDownstream(upState)
+          addDownstream(state, upSize, upState)
+        }
+
+        state.upSize++
+      }
+
+      return read(upState.resource) as TUpValue
+    }
+
+    public get set() {
+      return storeSet
+    }
+
+    public get getUntracked() {
+      return storeGet
+    }
+
+    public get signal(): AbortSignal {
+      // signal accessed while we are not the most recent push anymore,
+      // so this push is obsolete and is considered aborted
+      if (this.version < this.state.flags) {
+        const signal = AbortSignal.abort()
+        Object.defineProperty(this, 'signal', { value: signal })
+
+        return signal
+      }
+
+      // derivation still ongoing, ensure ctrl in state
+      this.state.ctrl ??= new AbortController()
+      Object.defineProperty(this, 'signal', { value: this.state.ctrl.signal })
+
+      return this.state.ctrl.signal
+    }
+
+    public get getSelf(): () => TValue {
+      const getSelf: () => TValue = () => read(this.state.init) as TValue
+
+      Object.defineProperty(this, 'getSelf', { value: getSelf })
+
+      return getSelf
+    }
+
+    public get setSelf() {
+      const setSelf = ((...args: never[]) =>
+        storeSet(this.state.atom as AnyWritableAtom, ...args)) as never
+
+      Object.defineProperty(this, 'setSelf', { value: setSelf })
+
+      return setSelf
+    }
+
+    public get deriveSelf() {
+      const deriveSelf = () => {
+        if (this.version < this.state.flags) {
+          statePush(this.state)
+        }
+      }
+
+      Object.defineProperty(this, 'deriveSelf', { value: deriveSelf })
+
+      return deriveSelf
+    }
+
+    public get context() {
+      this.state.context ??= {}
+
+      return this.state.context
+    }
+  }
+
+  // ensures state resource is up to date
+  const statePull = <TValue>(state: State<TValue>): void => {
+    if (state.flags & FLAGS_DIRTY) {
+      return statePush(state)
+    }
+
+    // mounted atoms that are not pending are up to date
+    if (state.flags & FLAGS_MOUNTED && !(state.flags & FLAGS_PENDING)) {
+      return
+    }
+
+    // Ensure that each upstream is up to date by calling `statePull` on them.
+    // If any of them got a new resource, then their respective `low` will have
+    // changed compared to our snapshot and we need to re-push.
+    if (state.high < epoch && hasUpstream(state)) {
+      const { upStates, upEpochs } = state
+      const { length } = upStates
+      for (let upLink = 0; upLink < length; upLink++) {
+        const upState = upStates[upLink]!
+        statePull(upState)
+
+        if (upEpochs[upLink] !== upState.low) {
+          return statePush(state)
+        }
+      }
+    }
+
+    state.flags &= ~FLAGS_PENDING
+    state.high = epoch
+  }
+
+  const stateMountAndPull = <TValue>(state: State<TValue>): void => {
+    if (state.flags & FLAGS_MOUNTED) {
+      return statePull(state)
+    }
+
+    state.flags |= FLAGS_MOUNTED
+    if (import.meta.env?.MODE !== 'production') {
+      mountedStates.add(state)
+    }
+
+    mountUpstream: {
+      if (state.flags & FLAGS_DIRTY) {
+        statePush(state)
+
+        break mountUpstream
+      }
+
+      if (hasUpstream(state)) {
+        const { upStates, upEpochs } = state
+        const { length } = upStates
+        for (let upLink = 0; upLink < length; upLink++) {
+          const upState = upStates[upLink]!
+          stateMountAndPull(upState)
+          assertDownstream(upState)
+          addDownstream(state, upLink, upState)
+
+          if (upEpochs[upLink] !== upState.low) {
+            statePush(state)
+
+            break mountUpstream
           }
-        },
-      )
-      return atomState
-    } catch (error) {
-      delete atomState.v
-      atomState.e = error
-      ++atomState.n
-      return atomState
+        }
+      }
+
+      state.flags &= ~FLAGS_PENDING
+      state.high = epoch
+    }
+
+    if (state.onUnmount === undefined && isStateWithOnMount(state)) {
+      try {
+        state.onUnmount = state.atom.onMount((...args) =>
+          storeSet(state.atom, ...args),
+        )
+      } catch (e) {
+        store.reportError(e)
+      }
+    }
+  }
+
+  const stateUnmount = <TValue>(state: State<TValue>): void => {
+    if (!(state.flags & FLAGS_MOUNTED)) {
+      return
+    }
+
+    // FIXME doesn't work with mutually dependent atoms
+    if (hasDownstream(state)) {
+      return
+    }
+
+    if (hasSubscribers(state)) {
+      return
+    }
+
+    state.flags &= ~FLAGS_MOUNTED
+    if (import.meta.env?.MODE !== 'production') {
+      mountedStates.delete(state)
+    }
+
+    if (hasUpstream(state)) {
+      const { upStates } = state
+      const { length } = upStates
+      for (let upLink = 0; upLink < length; upLink++) {
+        const upState = upStates[upLink]!
+        if (hasDownstream(upState)) {
+          deleteDownstream(state, upLink, upState)
+          stateUnmount(upState)
+        }
+      }
+    }
+
+    if (state.onUnmount !== undefined && !(state.flags & FLAGS_UNMOUNTED)) {
+      state.flags |= FLAGS_UNMOUNTED
+      unmounted.push(state)
+    }
+
+    // TODO 0041 i dont think we should abort on unmount
+    // state.ctrl?.abort()
+    // state.ctrl = undefined
+  }
+
+  const unpulled: State[] = []
+  const unmounted: State[] = []
+  const changed: StateWithSubscribers[] = []
+  let opened = false
+  const noop = () => {}
+  const open = (): typeof close => {
+    if (opened) {
+      return noop
+    }
+
+    opened = true
+
+    return close
+  }
+  const close = () => {
+    flushUnpulled()
+    opened = false
+    flushUnmounted()
+    flushChanged()
+  }
+  const flushUnpulled = (): void => {
+    for (
+      let state = unpulled.pop();
+      state !== undefined;
+      state = unpulled.pop()
+    ) {
+      state.flags &= ~FLAGS_UNPULLED
+      if (!(state.flags & FLAGS_MOUNTED)) {
+        continue
+      }
+
+      statePull(state)
+    }
+  }
+  const flushUnmounted = (): void => {
+    for (
+      let state = unmounted.pop();
+      state !== undefined;
+      state = unmounted.pop()
+    ) {
+      state.flags &= ~FLAGS_UNMOUNTED
+      if (state.flags & FLAGS_MOUNTED) {
+        continue
+      }
+
+      const { onUnmount } = state
+      if (onUnmount === undefined) {
+        continue
+      }
+      state.onUnmount = undefined
+
+      try {
+        onUnmount()
+      } catch (e) {
+        store.reportError(e)
+      }
+    }
+  }
+  const flushChanged = (): void => {
+    for (
+      let state = changed.pop();
+      state !== undefined;
+      state = changed.pop()
+    ) {
+      state.flags &= ~FLAGS_CHANGED
+
+      for (const subscriber of state.subscribers) {
+        try {
+          subscriber()
+        } catch (e) {
+          store.reportError(e)
+        }
+      }
+    }
+  }
+
+  const storeResource: Store['resource'] = (atom) => {
+    const state = stateGet(atom)
+    statePull(state)
+
+    return state.resource
+  }
+
+  const storeGet: Store['get'] = (atom) => read(storeResource(atom)) as never
+
+  const storeSet: Store['set'] = (atom, ...args) => {
+    const setter = ((target: AnyWritableAtom, ...args: unknown[]): unknown => {
+      if (target !== atom) {
+        return storeSet(target, ...args)
+      }
+
+      if (target.derived) {
+        // technically possible but restricted as it may cause bugs
+        throw new Error('Atom not writable')
+      }
+
+      const close = open()
+      try {
+        const state = stateGet(target)
+        state.flags |= FLAGS_SET_PUSH
+        state.init = toResource(args[0])
+        // TODO 0003 adapt primitive atom to allow abortables as 2nd arg
+        // this is to allow primitive atoms with promise values to be aborted
+        const ctrl = toCtrl(args[1])
+        statePush(state, ctrl)
+
+        return undefined
+      } finally {
+        close()
+      }
+    }) as Setter
+
+    const close = open()
+    try {
+      return atom.write(storeGet, setter, ...args)
     } finally {
-      isSync = false
+      close()
     }
   }
 
-  const readAtom = <Value>(atom: Atom<Value>): Value =>
-    returnAtomValue(readAtomState(undefined, atom, getAtomState(atom)))
+  const storeSub: Store['sub'] = (atom, subscriber) => {
+    const close = open()
+    const state = stateGet(atom)
+    stateMountAndPull(state)
+    close()
 
-  const getDependents = <Value>(
-    pending: Pending,
-    atom: Atom<Value>,
-    atomState: AtomState<Value>,
-  ): Map<AnyAtom, AtomState> => {
-    const dependents = new Map<AnyAtom, AtomState>()
-    for (const a of atomState.m?.t || []) {
-      dependents.set(a, getAtomState(a, atomState))
-    }
-    for (const atomWithPendingContinuablePromise of atomState.p) {
-      dependents.set(
-        atomWithPendingContinuablePromise,
-        getAtomState(atomWithPendingContinuablePromise, atomState),
-      )
-    }
-    getPendingDependents(pending, atom)?.forEach((dependent) => {
-      dependents.set(dependent, getAtomState(dependent, atomState))
-    })
-    return dependents
-  }
+    assertSubscribers(state)
 
-  const recomputeDependents = <Value>(
-    pending: Pending,
-    atom: Atom<Value>,
-    atomState: AtomState<Value>,
-  ) => {
-    // This is a topological sort via depth-first search, slightly modified from
-    // what's described here for simplicity and performance reasons:
-    // https://en.wikipedia.org/wiki/Topological_sorting#Depth-first_search
-
-    // Step 1: traverse the dependency graph to build the topsorted atom list
-    // We don't bother to check for cycles, which simplifies the algorithm.
-    const topsortedAtoms: (readonly [
-      atom: AnyAtom,
-      atomState: AtomState,
-      epochNumber: number,
-    ])[] = []
-    const markedAtoms = new Set<AnyAtom>()
-    const visit = (a: AnyAtom, aState: AtomState) => {
-      if (markedAtoms.has(a)) {
+    const unsubscribe: Unsubscribe & WithSubscriberIndex = () => {
+      const index = unsubscribe[SUBSCRIBER_INDEX]
+      // we were already unsubscribed
+      if (index === undefined) {
         return
       }
-      markedAtoms.add(a)
-      for (const [d, s] of getDependents(pending, a, aState)) {
-        if (a !== d) {
-          visit(d, s)
-        }
+      unsubscribe[SUBSCRIBER_INDEX] = undefined
+
+      // "move" the subscriber at end of the list into our position unless we
+      // are the at the end ourselves
+      const lastIndex = state.subscribers.length - 1
+      if (index < lastIndex) {
+        state.subscribers[index] = state.subscribers[lastIndex]!
+        state.unsubscribes[index] = state.unsubscribes[lastIndex]!
+        state.unsubscribes[index]![SUBSCRIBER_INDEX] = index
       }
-      // The algorithm calls for pushing onto the front of the list. For
-      // performance, we will simply push onto the end, and then will iterate in
-      // reverse order later.
-      topsortedAtoms.push([a, aState, aState.n])
+
+      state.subscribers.pop()
+      state.unsubscribes.pop()
+
+      const close = open()
+      stateUnmount(state)
+      close()
     }
-    // Visit the root atom. This is the only atom in the dependency graph
-    // without incoming edges, which is one reason we can simplify the algorithm
-    visit(atom, atomState)
-    // Step 2: use the topsorted atom list to recompute all affected atoms
-    // Track what's changed, so that we can short circuit when possible
-    const changedAtoms = new Set<AnyAtom>([atom])
-    const isMarked = (a: AnyAtom) => markedAtoms.has(a)
-    for (let i = topsortedAtoms.length - 1; i >= 0; --i) {
-      const [a, aState, prevEpochNumber] = topsortedAtoms[i]!
-      let hasChangedDeps = false
-      for (const dep of aState.d.keys()) {
-        if (dep !== a && changedAtoms.has(dep)) {
-          hasChangedDeps = true
-          break
-        }
-      }
-      if (hasChangedDeps) {
-        readAtomState(pending, a, aState, isMarked)
-        mountDependencies(pending, a, aState)
-        if (prevEpochNumber !== aState.n) {
-          addPendingAtom(pending, a, aState)
-          changedAtoms.add(a)
-        }
-      }
-      markedAtoms.delete(a)
-    }
+    unsubscribe[SUBSCRIBER_INDEX] = state.subscribers.length
+
+    state.subscribers.push(subscriber)
+    state.unsubscribes.push(unsubscribe)
+
+    return unsubscribe
   }
 
-  const writeAtomState = <Value, Args extends unknown[], Result>(
-    pending: Pending,
-    atom: WritableAtom<Value, Args, Result>,
-    atomState: AtomState<Value>,
-    ...args: Args
-  ): Result => {
-    const getter: Getter = <V>(a: Atom<V>) =>
-      returnAtomValue(readAtomState(pending, a, getAtomState(a, atomState)))
-    const setter: Setter = <V, As extends unknown[], R>(
-      a: WritableAtom<V, As, R>,
-      ...args: As
-    ) => {
-      const aState = getAtomState(a, atomState)
-      let r: R | undefined
-      if (isSelfAtom(atom, a)) {
-        if (!hasInitialValue(a)) {
-          // NOTE technically possible but restricted as it may cause bugs
-          throw new Error('atom not writable')
-        }
-        const hasPrevValue = 'v' in aState
-        const prevValue = aState.v
-        const v = args[0] as V
-        setAtomStateValueOrPromise(a, aState, v)
-        mountDependencies(pending, a, aState)
-        if (!hasPrevValue || !Object.is(prevValue, aState.v)) {
-          addPendingAtom(pending, a, aState)
-          recomputeDependents(pending, a, aState)
-        }
-      } else {
-        r = writeAtomState(pending, a, aState, ...args) as R
-      }
-      flushPending(pending)
-      return r as R
-    }
-    const result = atom.write(getter, setter, ...args)
-    return result
+  const store: Store & Partial<DevStore> = {
+    get: storeGet,
+    resource: storeResource,
+    set: storeSet,
+    sub: storeSub,
+    reportError: globalThis.reportError ?? console.error,
+    unstable_derive: () => {
+      throw new Error('Not implemented')
+    },
   }
 
-  const writeAtom = <Value, Args extends unknown[], Result>(
-    atom: WritableAtom<Value, Args, Result>,
-    ...args: Args
-  ): Result => {
-    const pending = createPending()
-    const result = writeAtomState(pending, atom, getAtomState(atom), ...args)
-    flushPending(pending)
-    return result
-  }
-
-  const mountDependencies = (
-    pending: Pending,
-    atom: AnyAtom,
-    atomState: AtomState,
-  ) => {
-    if (atomState.m && !getPendingContinuablePromise(atomState)) {
-      for (const a of atomState.d.keys()) {
-        if (!atomState.m.d.has(a)) {
-          const aMounted = mountAtom(pending, a, getAtomState(a, atomState))
-          aMounted.t.add(atom)
-          atomState.m.d.add(a)
-        }
-      }
-      for (const a of atomState.m.d || []) {
-        if (!atomState.d.has(a)) {
-          atomState.m.d.delete(a)
-          const aMounted = unmountAtom(pending, a, getAtomState(a, atomState))
-          aMounted?.t.delete(atom)
-        }
-      }
-    }
-  }
-
-  const mountAtom = <Value>(
-    pending: Pending,
-    atom: Atom<Value>,
-    atomState: AtomState<Value>,
-  ): Mounted => {
-    if (!atomState.m) {
-      // recompute atom state
-      readAtomState(pending, atom, atomState)
-      // mount dependencies first
-      for (const a of atomState.d.keys()) {
-        const aMounted = mountAtom(pending, a, getAtomState(a, atomState))
-        aMounted.t.add(atom)
-      }
-      // mount self
-      atomState.m = {
-        l: new Set(),
-        d: new Set(atomState.d.keys()),
-        t: new Set(),
-      }
-      if (import.meta.env?.MODE !== 'production') {
-        debugMountedAtoms.add(atom)
-      }
-      if (isActuallyWritableAtom(atom) && atom.onMount) {
-        const mounted = atomState.m
-        const { onMount } = atom
-        addPendingFunction(pending, () => {
-          const onUnmount = onMount((...args) =>
-            writeAtomState(pending, atom, atomState, ...args),
-          )
-          if (onUnmount) {
-            mounted.u = onUnmount
-          }
-        })
-      }
-    }
-    return atomState.m
-  }
-
-  const unmountAtom = <Value>(
-    pending: Pending,
-    atom: Atom<Value>,
-    atomState: AtomState<Value>,
-  ): Mounted | undefined => {
-    if (
-      atomState.m &&
-      !atomState.m.l.size &&
-      !Array.from(atomState.m.t).some((a) =>
-        getAtomState(a, atomState).m?.d.has(atom),
-      )
-    ) {
-      // unmount self
-      const onUnmount = atomState.m.u
-      if (onUnmount) {
-        addPendingFunction(pending, onUnmount)
-      }
-      delete atomState.m
-      if (import.meta.env?.MODE !== 'production') {
-        debugMountedAtoms.delete(atom)
-      }
-      // unmount dependencies
-      for (const a of atomState.d.keys()) {
-        const aMounted = unmountAtom(pending, a, getAtomState(a, atomState))
-        aMounted?.t.delete(atom)
-      }
-      // abort pending promise
-      const pendingPromise = getPendingContinuablePromise(atomState)
-      if (pendingPromise) {
-        // FIXME using `undefined` is kind of a hack.
-        pendingPromise[CONTINUE_PROMISE](undefined, () => {})
-      }
-      return undefined
-    }
-    return atomState.m
-  }
-
-  const subscribeAtom = (atom: AnyAtom, listener: () => void) => {
-    const pending = createPending()
-    const atomState = getAtomState(atom)
-    const mounted = mountAtom(pending, atom, atomState)
-    flushPending(pending)
-    const listeners = mounted.l
-    listeners.add(listener)
-    return () => {
-      listeners.delete(listener)
-      const pending = createPending()
-      unmountAtom(pending, atom, atomState)
-      flushPending(pending)
-    }
-  }
-
-  const unstable_derive = (fn: (...args: StoreArgs) => StoreArgs) =>
-    buildStore(...fn(getAtomState))
-
-  const store: Store = {
-    get: readAtom,
-    set: writeAtom,
-    sub: subscribeAtom,
-    unstable_derive,
-  }
   if (import.meta.env?.MODE !== 'production') {
-    const devStore: DevStoreRev4 = {
-      // store dev methods (these are tentative and subject to change without notice)
-      dev4_get_internal_weak_map: () => ({
-        get: (atom) => {
-          const atomState = getAtomState(atom)
-          if (atomState.n === 0) {
-            // for backward compatibility
-            return undefined
-          }
-          return atomState
-        },
-      }),
-      dev4_get_mounted_atoms: () => debugMountedAtoms,
-      dev4_restore_atoms: (values) => {
-        const pending = createPending()
-        for (const [atom, value] of values) {
-          if (hasInitialValue(atom)) {
-            const atomState = getAtomState(atom)
-            const hasPrevValue = 'v' in atomState
-            const prevValue = atomState.v
-            setAtomStateValueOrPromise(atom, atomState, value)
-            mountDependencies(pending, atom, atomState)
-            if (!hasPrevValue || !Object.is(prevValue, atomState.v)) {
-              addPendingAtom(pending, atom, atomState)
-              recomputeDependents(pending, atom, atomState)
-            }
-          }
+    // store dev methods (these are tentative and subject to change without notice)
+    store.dev4_get_internal_weak_map = () => ({
+      get: (atom) => {
+        const state = states.get(atom)
+        if (state === undefined) {
+          return undefined
         }
-        flushPending(pending)
+
+        const d: LegacyState['d'] = new Map(
+          hasUpstream(state)
+            ? state.upStates.map((upState, index) => [
+                upState.atom,
+                state.upEpochs[index] ?? 0,
+              ])
+            : undefined,
+        )
+
+        return {
+          d,
+          p: new Set(),
+          n: state.low,
+          m:
+            state.flags & FLAGS_MOUNTED
+              ? {
+                  l: new Set(state.subscribers),
+                  d: new Set(d.keys()),
+                  t: new Set([
+                    atom,
+                    ...(state.downStates?.map(({ atom }) => atom) ?? []),
+                  ]),
+                  u: state.onUnmount ?? undefined,
+                }
+              : undefined,
+          v:
+            state.resource.status === 'pending'
+              ? state.resource
+              : state.resource.status === 'fulfilled'
+                ? state.resource.value
+                : undefined,
+          e:
+            state.resource.status === 'rejected'
+              ? state.resource.reason
+              : undefined,
+        }
       },
+    })
+    store.dev4_get_mounted_atoms = function* () {
+      for (const state of mountedStates) {
+        yield state.atom
+      }
     }
-    Object.assign(store, devStore)
+    store.dev4_restore_atoms = (values) => {
+      const close = open()
+
+      for (const [atom, value] of values) {
+        const state = stateGet(atom)
+        if (state.atom.derived) {
+          continue
+        }
+
+        state.init = toResource(value)
+        state.flags |= FLAGS_SET_PUSH
+        statePush(state)
+      }
+
+      close()
+    }
   }
+
   return store
 }
 
-export const createStore = (): Store => {
-  const atomStateMap = new WeakMap()
-  const getAtomState = <Value>(atom: Atom<Value>) => {
-    let atomState = atomStateMap.get(atom) as AtomState<Value> | undefined
-    if (!atomState) {
-      atomState = { d: new Map(), p: new Set(), n: 0 }
-      atomStateMap.set(atom, atomState)
-    }
-    return atomState
-  }
-  return buildStore(getAtomState)
-}
+let defaultStore: Store | DevStore | undefined
 
-let defaultStore: Store | undefined
-
-export const getDefaultStore = (): Store => {
-  if (!defaultStore) {
+export const getDefaultStore = (): Store | DevStore => {
+  if (defaultStore === undefined) {
     defaultStore = createStore()
+
     if (import.meta.env?.MODE !== 'production') {
-      ;(globalThis as any).__JOTAI_DEFAULT_STORE__ ||= defaultStore
-      if ((globalThis as any).__JOTAI_DEFAULT_STORE__ !== defaultStore) {
+      const global = globalThis as any
+      global.__JOTAI_DEFAULT_STORE__ ??= defaultStore
+      if (global.__JOTAI_DEFAULT_STORE__ !== defaultStore) {
         console.warn(
           'Detected multiple Jotai instances. It may cause unexpected behavior with the default store. https://github.com/pmndrs/jotai/discussions/2044',
         )
       }
     }
   }
+
   return defaultStore
 }

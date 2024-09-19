@@ -70,11 +70,20 @@ describe('[DEV-ONLY] dev-only methods rev4', () => {
         (a, b) => Object.keys(a).length - Object.keys(b).length,
       ),
     ).toStrictEqual([
-      { toString: expect.any(Function), read: expect.any(Function) },
       {
-        toString: expect.any(Function),
-        init: 0,
+        derived: true,
+        init: undefined,
+        is: expect.any(Function),
         read: expect.any(Function),
+        toString: expect.any(Function),
+        write: undefined,
+      },
+      {
+        derived: false,
+        init: 0,
+        is: expect.any(Function),
+        read: expect.any(Function),
+        toString: expect.any(Function),
         write: expect.any(Function),
         debugLabel: 'countAtom',
       },

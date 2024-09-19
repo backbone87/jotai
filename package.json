@@ -53,7 +53,8 @@
         "types": "./*.d.ts",
         "default": "./*.js"
       }
-    }
+    },
+    "./internal.ts": null
   },
   "files": [
     "**"

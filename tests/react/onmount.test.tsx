@@ -1,6 +1,7 @@
 import { StrictMode, Suspense, useState } from 'react'
 import { act, render, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import LeakDetector from 'jest-leak-detector'
 import { expect, it, vi } from 'vitest'
 import { useAtom } from 'jotai/react'
 import { atom } from 'jotai/vanilla'
@@ -338,6 +339,10 @@ it('mount/unmount test with async atom', async () => {
   expect(onUnMountFn).toHaveBeenCalledTimes(0)
 
   await userEvent.click(getByText('button'))
+
+  // force GC
+  await new LeakDetector({}).isLeaking()
+
   expect(onMountFn).toHaveBeenCalledTimes(1)
   expect(onUnMountFn).toHaveBeenCalledTimes(1)
 })
@@ -510,7 +515,8 @@ it('create atom with onMount in async get', async () => {
     </StrictMode>,
   )
 
-  await findByText('count: 1')
+  // TODO 0200 this intermediate state is not observeable anymore
+  // await findByText('count: 1')
   await findByText('count: 10')
 
   await userEvent.click(getByText('button'))

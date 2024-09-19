@@ -10,8 +10,7 @@ import { atom } from 'jotai/vanilla'
 const { use, useTransition } = ReactExports
 
 describe.skipIf(typeof useTransition !== 'function')('useTransition', () => {
-  // FIXME some tests are failing with react@experimental
-  it.skipIf(typeof use === 'function')(
+  it(
     'no extra commit with useTransition (#1125)',
     async () => {
       const countAtom = atom(0)
@@ -33,6 +32,7 @@ describe.skipIf(typeof useTransition !== 'function')('useTransition', () => {
         return (
           <>
             <div>delayed: {delayed}</div>
+            <div>{pending && 'pending'}</div>
             <button
               onClick={() => startTransition(() => setCount((c) => c + 1))}
             >
@@ -42,7 +42,7 @@ describe.skipIf(typeof useTransition !== 'function')('useTransition', () => {
         )
       }
 
-      const { getByText } = render(
+      const { getByText, asFragment } = render(
         <>
           <Suspense fallback="loading">
             <Counter />
@@ -50,16 +50,16 @@ describe.skipIf(typeof useTransition !== 'function')('useTransition', () => {
         </>,
       )
 
-      resolve()
-      await waitFor(() => expect(getByText('delayed: 0')).toBeTruthy())
+      expect(asFragment()).toMatchSnapshot()
+
+      await act(async () => resolve())
+      expect(asFragment()).toMatchSnapshot()
 
       await userEvent.click(getByText('button'))
+      expect(asFragment()).toMatchSnapshot()
 
-      act(() => {
-        resolve()
-      })
-
-      await waitFor(() => expect(getByText('delayed: 1')).toBeTruthy())
+      await act(async () => resolve())
+      expect(asFragment()).toMatchSnapshot()
 
       expect(commited).toEqual([
         { pending: false, delayed: 0 },

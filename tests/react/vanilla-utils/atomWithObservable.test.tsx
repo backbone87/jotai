@@ -2,6 +2,7 @@ import { Component, StrictMode, Suspense, useState } from 'react'
 import type { ReactElement, ReactNode } from 'react'
 import { act, render, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import LeakDetector from 'jest-leak-detector'
 import { BehaviorSubject, Observable, Subject, delay, map, of } from 'rxjs'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { fromValue, makeSubject, pipe, toObservable } from 'wonka'
@@ -212,6 +213,9 @@ it('only subscribe once per atom', async () => {
   rerender(<div />)
   expect(totalSubscriptions).toEqual(1)
 
+  // make sure GC happened
+  await new LeakDetector({}).isLeaking()
+
   rerender(
     <>
       <Suspense fallback="loading">
@@ -257,6 +261,10 @@ it('cleanup subscription', async () => {
 
   expect(activeSubscriptions).toEqual(1)
   rerender(<div />)
+
+  // make sure GC happened
+  await new LeakDetector({}).isLeaking()
+
   await waitFor(() => expect(activeSubscriptions).toEqual(0))
 })
 

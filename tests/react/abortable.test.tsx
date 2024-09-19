@@ -1,6 +1,7 @@
 import { StrictMode, Suspense, useState } from 'react'
 import { render, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import LeakDetector from 'jest-leak-detector'
 import { describe, expect, it } from 'vitest'
 import { useAtomValue, useSetAtom } from 'jotai/react'
 import { atom } from 'jotai/vanilla'
@@ -167,6 +168,9 @@ describe('abortable atom test', () => {
     await userEvent.click(getByText('toggle'))
 
     await findByText('hidden')
+
+    // force GC
+    await new LeakDetector({}).isLeaking()
 
     resolve.splice(0).forEach((fn) => fn())
     await waitFor(() => expect(abortedCount).toBe(0))

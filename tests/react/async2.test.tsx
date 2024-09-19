@@ -202,18 +202,18 @@ describe('timing issue with setSelf', () => {
     // The use of fireEvent is required to reproduce the issue
     fireEvent.click(getByText('button'))
 
-    await waitFor(() => assert(resolve.length === 3))
+    // TODO 0006 see comments in vanilla store tests
+    await waitFor(() => assert(resolve.length === 2))
     resolve[1]!()
-    resolve[2]!()
 
     await waitFor(() => assert(result === 2))
 
     // The use of fireEvent is required to reproduce the issue
     fireEvent.click(getByText('button'))
 
-    await waitFor(() => assert(resolve.length === 5))
-    resolve[3]!()
-    resolve[4]!()
+    // TODO 0006 see comments in vanilla store tests
+    await waitFor(() => assert(resolve.length === 3))
+    resolve[2]!()
 
     await findByText('count: 4')
     expect(result).toBe(4) // 3
@@ -221,6 +221,10 @@ describe('timing issue with setSelf', () => {
 })
 
 describe('infinite pending', () => {
+  // TODO 0011 this does not work is because no one is subscribed to the atom
+  // while the component is suspended. i am not sure if that should be solved
+  // within the store or within the react integration.
+  // update: this works with the finalization registry in useAtomValue
   it('odd counter', async () => {
     const countAtom = atom(0)
     const asyncAtom = atom((get) => {

@@ -91,6 +91,7 @@ describe('atomWithStorage (sync)', () => {
       const [count] = useAtom(countAtom)
       // emulating updating before mount
       if (dummyStorage.getItem('count', 1) !== 9) {
+        dummyStorage.setItem('count', 9)
         dummyStorage.emitStorageEvent('count', 9)
       }
       return <div>count: {count}</div>
